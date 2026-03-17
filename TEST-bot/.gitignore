@@ -1,0 +1,19 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+
+# Data & models (large files)
+data/*.csv
+models/*.pkl
+
+# Logs
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
