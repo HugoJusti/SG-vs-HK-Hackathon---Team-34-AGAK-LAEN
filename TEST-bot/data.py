@@ -106,7 +106,7 @@ def load_or_fetch_historical(pair: str, force_refresh: bool = False) -> pd.DataF
             logger.info(f"Using cached data for {symbol} ({len(df)} candles)")
             return df
 
-    df = fetch_binance_klines(symbol, "1h", HMM_TRAINING_HOURS)
+    df = fetch_binance_klines(symbol, "5m", HMM_TRAINING_HOURS * 12)
     if not df.empty:
         df.to_csv(cache_path, index=False)
     return df
@@ -137,7 +137,8 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # 2. Rolling volatility (20-period, annualised for hourly data)
     #    Annualisation factor: sqrt(24 * 365) ≈ sqrt(8760)
-    df["rolling_vol"] = df["log_return"].rolling(window=20).std() * np.sqrt(8760)
+    # df["rolling_vol"] = df["log_return"].rolling(window=20).std() * np.sqrt(8760)
+    df["rolling_vol"] = df["log_return"].rolling(window=20).std() * np.sqrt(105120)
 
     # 3. Momentum (10-period Rate of Change)
     df["momentum"] = df["close"].pct_change(periods=10)
@@ -184,8 +185,8 @@ def compute_live_features(historical_df: pd.DataFrame, live_price: float,
 
     # Rolling vol (last 20 log returns, annualised)
     log_returns = np.diff(np.log(closes[-21:]))
-    rolling_vol = np.std(log_returns) * np.sqrt(8760)
-
+    # rolling_vol = np.std(log_returns) * np.sqrt(8760)
+    rolling_vol = np.std(log_returns) * np.sqrt(105120)
     # Momentum (10-period ROC)
     momentum = (closes[-1] - closes[-11]) / closes[-11]
 
@@ -206,3 +207,12 @@ def compute_live_features(historical_df: pd.DataFrame, live_price: float,
         "ma50": ma50,
         "close": live_price,
     }
+from sklearn.preprocessing import StandardScaler
+
+def get_scaled_hmm_observations(df):
+    """Scale features to zero mean, unit variance for better HMM training."""
+    feature_cols = ["log_return", "rolling_vol", "momentum", "volume_zscore"]
+    raw = df[feature_cols].values
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(raw)
+    return scaled, scaler

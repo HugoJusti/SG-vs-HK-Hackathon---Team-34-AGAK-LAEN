@@ -23,14 +23,15 @@ HMM_FEATURES = [                # observation features fed to HMM
     "momentum",
     "volume_zscore",
 ]
-HMM_TRAINING_HOURS = 2 * 365 * 24   # ~2 years of hourly data
+# HMM_TRAINING_HOURS = 2 * 365 * 24   # ~2 years of hourly data
+HMM_TRAINING_HOURS = 6 * 30 * 24    # 6 months
 HMM_RETRAIN_INTERVAL_HOURS = 24     # retrain HMM every 24 hours
 
 # ── Entry Thresholds ─────────────────────────────────────────
 ENTRY_HMM_CONFIDENCE = 0.65     # P(bullish) must exceed this
 ENTRY_MAX_VOLATILITY = 0.50    # annualised rolling vol cap (5.5%)
 ENTRY_MOMENTUM_MIN = 0.0        # 10-period ROC must be > 0
-ENTRY_VOLUME_ZSCORE_MAX = 2.0   # |z| must be below this
+ENTRY_VOLUME_ZSCORE_MAX = 4.0   # |z| must be below this
 ENTRY_MA_SHORT = 20             # close > MA20 required
 ENTRY_SPREAD_MAX_PCT = 0.05     # bid-ask spread filter (Option B)
 
@@ -60,7 +61,8 @@ LIMIT_ORDER_TIMEOUT_SEC = 45     # cancel unfilled limit after this
 LIMIT_ORDER_FALLBACK_MARKET = True  # use market order if limit fails
 
 # ── Polling & Rate Limits ────────────────────────────────────
-POLL_INTERVAL_SEC = 120        # check signals every 2 minutes
+# POLL_INTERVAL_SEC = 120        # check signals every 2 minutes
+POLL_INTERVAL_SEC = 60        # check signals every 2 minutes
 MAX_API_CALLS_PER_MIN = 30
 RETRY_BASE_DELAY_SEC = 1.0
 RETRY_MAX_ATTEMPTS = 3
