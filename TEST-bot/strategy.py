@@ -311,8 +311,14 @@ class SignalGenerator:
             spread_ok = spread_pct < ENTRY_SPREAD_MAX_PCT
             entry_checks.append(("Spread filter", spread_ok,
                                  f"spread={spread_pct:.4f}% vs {ENTRY_SPREAD_MAX_PCT}%"))
-
-            all_pass = all(check[1] for check in entry_checks)
+            confluences = len(entry_checks)
+            passing = 0
+            all_pass = 0
+            for check in entry_checks :
+                passing += check[1]
+            if passing >= confluences // 2 : 
+                all_pass = 1
+            # all_pass = all(check[1] for check in entry_checks)
 
             if all_pass:
                 action = "BUY"

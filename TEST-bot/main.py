@@ -273,10 +273,16 @@ class TradingBot:
 
         # Get precision from exchange info
         quantity = position_usd / price
-        # Round to reasonable precision (6 for BTC, 4 for ETH)
-        precision = 6 if coin == "BTC" else 4
+
+        # Get precision from exchange info
+        exchange_info = self.client.get_exchange_info()
+        pair_info = exchange_info.get("TradePairs", {}).get(pair, {})
+        precision = pair_info.get("AmountPrecision", 6)
         quantity = round(quantity, precision)
 
+        # Floor instead of round to avoid exceeding balance
+        factor = 10 ** precision
+        quantity = int(quantity * factor) / factor
         if quantity * price < 1.0:  # MiniOrder check
             self.logger.info(f"  Order too small: ${quantity * price:.2f} < $1.00")
             return
