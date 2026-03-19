@@ -316,10 +316,10 @@ class SignalGenerator:
 
             if all_pass:
                 action = "BUY"
-                reasons = [f"✓ {c[0]}: {c[2]}" for c in entry_checks]
+                reasons = [f"[PASS] {c[0]}: {c[2]}" for c in entry_checks]
             else:
                 action = "HOLD"
-                reasons = [f"{'✓' if c[1] else '✗'} {c[0]}: {c[2]}" for c in entry_checks]
+                reasons = [f"{'[PASS]' if c[1] else '[FAIL]'} {c[0]}: {c[2]}" for c in entry_checks]
 
             return {
                 "action": action,
