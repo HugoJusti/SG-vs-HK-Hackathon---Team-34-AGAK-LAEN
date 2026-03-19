@@ -34,6 +34,13 @@ ENTRY_VOLUME_ZSCORE_MAX = 2.0   # |z| must be below this
 ENTRY_MA_SHORT = 20             # close > MA20 required
 ENTRY_SPREAD_MAX_PCT = 0.05     # bid-ask spread filter (Option B)
 
+# ENTRY_HMM_CONFIDENCE = 0.65     # P(bullish) must exceed this
+# ENTRY_MAX_VOLATILITY = 0.30    # annualised rolling vol cap (5.5%)
+# ENTRY_MOMENTUM_MIN = 0.02        # 10-period ROC must be > 0
+# ENTRY_VOLUME_ZSCORE_MAX = 5.0   # |z| must be below this
+# ENTRY_MA_SHORT = 67676             # close > MA20 required
+# ENTRY_SPREAD_MAX_PCT = 0.05     # bid-ask spread filter (Option B)
+
 # ── Exit Thresholds ──────────────────────────────────────────
 EXIT_HMM_CONFIDENCE = 0.60      # P(bearish) triggers exit
 EXIT_MA_LONG = 50               # close < MA50 emergency exit
@@ -71,6 +78,9 @@ LOG_LEVEL = "INFO"
 LOG_TRADES_FILE = "logs/trades.jsonl"
 LOG_SIGNALS_FILE = "logs/signals.jsonl"
 LOG_ERRORS_FILE = "logs/errors.log"
+LOG_METRICS_PLOT = "logs/performance_metrics.png"
+ENABLE_METRICS_REPORTING = True
+METRICS_UPDATE_EVERY_CYCLES = 1
 
 # ── Data Paths ───────────────────────────────────────────────
 DATA_DIR = "data"

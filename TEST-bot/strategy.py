@@ -46,6 +46,9 @@ class RegimeHMM:
         """
         logger.info(f"Training HMM for {pair} on {len(observations)} observations...")
 
+        if observations is None or len(observations) == 0:
+            raise ValueError(f"No HMM observations available for {pair}")
+
         self.model = GaussianHMM(
             n_components=HMM_N_STATES,
             covariance_type="full",
@@ -241,7 +244,12 @@ class SignalGenerator:
             current_position: {"side": "long"/"none", "entry_price": float, "pair": str}
         
         Returns:
-            {"action": "BUY"/"SELL"/"HOLD", "reasons": [str], "confidence": float}
+            {
+                "action": "BUY"/"SELL"/"HOLD",
+                "reasons": [str],
+                "confidence": float,
+                "entry_checks": [dict],
+            }
         """
         action = "HOLD"
         reasons = []
@@ -259,7 +267,8 @@ class SignalGenerator:
                 return {
                     "action": "SELL",
                     "reasons": [f"STOP LOSS: drawdown {drawdown*100:.2f}% >= {EXIT_STOP_LOSS_PCT*100}%"],
-                    "confidence": 1.0
+                    "confidence": 1.0,
+                    "entry_checks": [],
                 }
 
             # MA50 structural breakdown
@@ -267,7 +276,8 @@ class SignalGenerator:
                 return {
                     "action": "SELL",
                     "reasons": [f"MA50 BREAKDOWN: close {close:.2f} < MA50 {features['ma50']:.2f}"],
-                    "confidence": 0.9
+                    "confidence": 0.9,
+                    "entry_checks": [],
                 }
 
             # HMM bearish regime
@@ -275,7 +285,8 @@ class SignalGenerator:
                 return {
                     "action": "SELL",
                     "reasons": [f"HMM BEARISH: P(bear)={regime_probs['bearish']:.3f} > {EXIT_HMM_CONFIDENCE}"],
-                    "confidence": regime_probs["bearish"]
+                    "confidence": regime_probs["bearish"],
+                    "entry_checks": [],
                 }
 
         # ── ENTRY LOGIC (all conditions must pass) ──
@@ -284,52 +295,75 @@ class SignalGenerator:
 
             # 1. HMM bullish
             hmm_ok = regime_probs["bullish"] > ENTRY_HMM_CONFIDENCE
-            entry_checks.append(("HMM bullish", hmm_ok,
-                                 f"P(bull)={regime_probs['bullish']:.3f} vs {ENTRY_HMM_CONFIDENCE}"))
+            entry_checks.append({
+                "name": "HMM bullish",
+                "passed": hmm_ok,
+                "detail": f"P(bull)={regime_probs['bullish']:.3f} vs {ENTRY_HMM_CONFIDENCE}",
+            })
 
             # 2. Volatility filter
             vol_ok = features["rolling_vol"] < ENTRY_MAX_VOLATILITY
-            entry_checks.append(("Vol filter", vol_ok,
-                                 f"vol={features['rolling_vol']:.4f} vs {ENTRY_MAX_VOLATILITY}"))
+            entry_checks.append({
+                "name": "Vol filter",
+                "passed": vol_ok,
+                "detail": f"vol={features['rolling_vol']:.4f} vs {ENTRY_MAX_VOLATILITY}",
+            })
 
             # 3. Momentum filter
             mom_ok = features["momentum"] > ENTRY_MOMENTUM_MIN
-            entry_checks.append(("Momentum", mom_ok,
-                                 f"mom={features['momentum']:.6f} vs {ENTRY_MOMENTUM_MIN}"))
+            entry_checks.append({
+                "name": "Momentum",
+                "passed": mom_ok,
+                "detail": f"mom={features['momentum']:.6f} vs {ENTRY_MOMENTUM_MIN}",
+            })
 
             # 4. Volume z-score filter
             vz_ok = abs(features["volume_zscore"]) < ENTRY_VOLUME_ZSCORE_MAX
-            entry_checks.append(("Vol z-score", vz_ok,
-                                 f"|z|={abs(features['volume_zscore']):.3f} vs {ENTRY_VOLUME_ZSCORE_MAX}"))
+            entry_checks.append({
+                "name": "Vol z-score",
+                "passed": vz_ok,
+                "detail": f"|z|={abs(features['volume_zscore']):.3f} vs {ENTRY_VOLUME_ZSCORE_MAX}",
+            })
 
             # 5. MA20 confirmation
             ma_ok = close > features["ma20"]
-            entry_checks.append(("MA20 confirm", ma_ok,
-                                 f"close={close:.2f} vs MA20={features['ma20']:.2f}"))
+            entry_checks.append({
+                "name": "MA20 confirm",
+                "passed": ma_ok,
+                "detail": f"close={close:.2f} vs MA20={features['ma20']:.2f}",
+            })
 
             # 6. Spread filter (Option B — not in HMM, just a gate)
             spread_ok = spread_pct < ENTRY_SPREAD_MAX_PCT
-            entry_checks.append(("Spread filter", spread_ok,
-                                 f"spread={spread_pct:.4f}% vs {ENTRY_SPREAD_MAX_PCT}%"))
+            entry_checks.append({
+                "name": "Spread filter",
+                "passed": spread_ok,
+                "detail": f"spread={spread_pct:.4f}% vs {ENTRY_SPREAD_MAX_PCT}%",
+            })
 
-            all_pass = all(check[1] for check in entry_checks)
+            all_pass = all(check["passed"] for check in entry_checks)
 
             if all_pass:
                 action = "BUY"
-                reasons = [f"[PASS] {c[0]}: {c[2]}" for c in entry_checks]
+                reasons = [f"[PASS] {c['name']}: {c['detail']}" for c in entry_checks]
             else:
                 action = "HOLD"
-                reasons = [f"{'[PASS]' if c[1] else '[FAIL]'} {c[0]}: {c[2]}" for c in entry_checks]
+                reasons = [
+                    f"{'[PASS]' if c['passed'] else '[FAIL]'} {c['name']}: {c['detail']}"
+                    for c in entry_checks
+                ]
 
             return {
                 "action": action,
                 "reasons": reasons,
-                "confidence": regime_probs.get("bullish", 0) if all_pass else 0.0
+                "confidence": regime_probs.get("bullish", 0) if all_pass else 0.0,
+                "entry_checks": entry_checks,
             }
 
         # Holding position, no exit triggered
         return {
             "action": "HOLD",
             "reasons": ["Position held — no exit conditions met"],
-            "confidence": regime_probs.get("bullish", 0.5)
+            "confidence": regime_probs.get("bullish", 0.5),
+            "entry_checks": [],
         }

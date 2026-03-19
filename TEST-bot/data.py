@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import requests
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from config import (
     DATA_DIR, PAIRS, HMM_TRAINING_HOURS,
     ENTRY_MA_SHORT, EXIT_MA_LONG
@@ -101,7 +101,12 @@ def load_or_fetch_historical(pair: str, force_refresh: bool = False) -> pd.DataF
 
     if not force_refresh and os.path.exists(cache_path):
         df = pd.read_csv(cache_path, parse_dates=["open_time"])
-        age_hours = (datetime.utcnow() - df["open_time"].iloc[-1]).total_seconds() / 3600
+        last_open_time = df["open_time"].iloc[-1]
+        if getattr(last_open_time, "tzinfo", None) is None:
+            last_open_time = last_open_time.tz_localize(UTC)
+        else:
+            last_open_time = last_open_time.tz_convert(UTC)
+        age_hours = (datetime.now(UTC) - last_open_time).total_seconds() / 3600
         if age_hours < 24:
             logger.info(f"Using cached data for {symbol} ({len(df)} candles)")
             return df

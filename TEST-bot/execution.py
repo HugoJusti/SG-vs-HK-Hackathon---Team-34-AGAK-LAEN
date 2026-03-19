@@ -7,7 +7,7 @@ import hashlib
 import json
 import logging
 import requests
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from config import (
     BASE_URL, API_KEY, SECRET_KEY,
     USE_LIMIT_ORDERS, LIMIT_ORDER_OFFSET_PCT, LIMIT_ORDER_TIMEOUT_SEC,
@@ -18,6 +18,15 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _json_default(value):
+    """Normalize datetime and scalar wrapper values for JSON logging."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if hasattr(value, "item") and callable(value.item):
+        return value.item()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -242,7 +251,7 @@ class RoostooClient:
         import os
         os.makedirs(os.path.dirname(LOG_TRADES_FILE), exist_ok=True)
         entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "pair": pair,
             "side": side,
             "quantity": quantity,
@@ -256,7 +265,7 @@ class RoostooClient:
             "api_response": result,
         }
         with open(LOG_TRADES_FILE, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+            f.write(json.dumps(entry, default=_json_default) + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -372,7 +381,7 @@ class CooldownManager:
     def start_cooldown(self, pair: str):
         """Call this after exiting a position."""
         self.cooldowns[pair] = {
-            "exit_time": datetime.utcnow(),
+            "exit_time": datetime.now(UTC),
             "stability_count": 0,
         }
         logger.info(f"Cooldown started for {pair}")
@@ -386,7 +395,7 @@ class CooldownManager:
             return False
 
         cd = self.cooldowns[pair]
-        elapsed = (datetime.utcnow() - cd["exit_time"]).total_seconds() / 60
+        elapsed = (datetime.now(UTC) - cd["exit_time"]).total_seconds() / 60
 
         # Condition 1: minimum time
         if elapsed < COOLDOWN_MIN_MINUTES:

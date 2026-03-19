@@ -15,11 +15,13 @@ import json
 import logging
 import argparse
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from config import (
     PAIRS, POLL_INTERVAL_SEC, LOG_DIR, LOG_LEVEL,
-    LOG_SIGNALS_FILE, LOG_ERRORS_FILE, HMM_RETRAIN_INTERVAL_HOURS
+    LOG_SIGNALS_FILE, LOG_ERRORS_FILE, HMM_RETRAIN_INTERVAL_HOURS,
+    LOG_TRADES_FILE, LOG_METRICS_PLOT,
+    ENABLE_METRICS_REPORTING, METRICS_UPDATE_EVERY_CYCLES
 )
 from data import (
     load_or_fetch_historical, compute_features, get_hmm_observations,
@@ -47,6 +49,37 @@ def setup_logging():
             logging.FileHandler(LOG_ERRORS_FILE),
         ]
     )
+
+
+def build_metrics_report(logger, output_path: str = LOG_METRICS_PLOT):
+    """
+    Build the metrics report without making live trading fail at import time
+    when plotting dependencies are unavailable.
+    """
+    try:
+        from metrics import plot_metrics_report
+    except ImportError as exc:
+        logger.warning(f"Metrics disabled because plotting could not load: {exc}")
+        return None, None
+
+    try:
+        return plot_metrics_report(
+            signals_path=LOG_SIGNALS_FILE,
+            trades_path=LOG_TRADES_FILE,
+            output_path=output_path,
+        )
+    except Exception as exc:
+        logger.warning(f"Metrics refresh failed: {exc}")
+        return None, None
+
+
+def _json_default(value):
+    """Normalize NumPy scalars and datetimes for JSON logging."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -93,6 +126,7 @@ class TradingBot:
         self.historical_data = {}
         self.feature_data = {}
         self.last_train_time = {}
+        self.metrics_enabled = ENABLE_METRICS_REPORTING
 
         self.logger = logging.getLogger("Bot")
 
@@ -126,16 +160,25 @@ class TradingBot:
 
             # Compute features
             df_features = compute_features(df)
+            if df_features.empty:
+                self.logger.error(
+                    f"No usable feature rows for {pair}. "
+                    f"Loaded {len(df)} candles, but rolling features produced 0 rows."
+                )
+                continue
             self.historical_data[pair] = df
             self.feature_data[pair] = df_features
 
             # Train HMM
             hmm = RegimeHMM()
             observations = get_hmm_observations(df_features)
+            if len(observations) == 0:
+                self.logger.error(f"No HMM observations available for {pair}, skipping")
+                continue
             hmm.train(observations, pair)
             hmm.save(pair)
             self.hmm_models[pair] = hmm
-            self.last_train_time[pair] = datetime.utcnow()
+            self.last_train_time[pair] = datetime.now(UTC)
 
         # Check balance
         balance = self.client.get_balance()
@@ -146,6 +189,7 @@ class TradingBot:
     def run(self):
         """Main trading loop."""
         self.initialise()
+        self._refresh_metrics(cycle=0, force=True)
         self.logger.info("\n" + "=" * 60)
         self.logger.info("STARTING LIVE TRADING LOOP")
         self.logger.info(f"Poll interval: {POLL_INTERVAL_SEC}s")
@@ -155,8 +199,9 @@ class TradingBot:
         while True:
             cycle += 1
             try:
-                self.logger.info(f"\n{'─'*40} Cycle {cycle} {'─'*40}")
+                self.logger.info(f"\n{'-'*40} Cycle {cycle} {'-'*40}")
                 self._trading_cycle()
+                self._refresh_metrics(cycle)
 
             except KeyboardInterrupt:
                 self.logger.info("Shutdown requested. Exiting...")
@@ -174,6 +219,44 @@ class TradingBot:
             )
             time.sleep(POLL_INTERVAL_SEC)
 
+    def _refresh_metrics(self, cycle: int, force: bool = False):
+        """Refresh the saved metrics chart from the latest bot logs."""
+        if not self.metrics_enabled:
+            return
+
+        if not force and METRICS_UPDATE_EVERY_CYCLES > 1:
+            if cycle % METRICS_UPDATE_EVERY_CYCLES != 0:
+                return
+
+        summary, output_path = build_metrics_report(self.logger, LOG_METRICS_PLOT)
+        if not summary or not output_path:
+            self.metrics_enabled = False
+            return
+
+        total_return = (
+            f"{summary['total_return'] * 100:.2f}%"
+            if not np.isnan(summary["total_return"]) else "n/a"
+        )
+        sharpe = f"{summary['sharpe']:.2f}" if not np.isnan(summary["sharpe"]) else "n/a"
+        max_drawdown = (
+            f"{summary['max_drawdown'] * 100:.2f}%"
+            if not np.isnan(summary["max_drawdown"]) else "n/a"
+        )
+        hit_rate = (
+            f"{summary['hit_rate'] * 100:.2f}%"
+            if not np.isnan(summary["hit_rate"]) else "n/a"
+        )
+
+        self.logger.info(
+            "Metrics updated: %s | closed_trades=%s total_return=%s sharpe=%s max_drawdown=%s hit_rate=%s",
+            output_path,
+            summary["closed_trades"],
+            total_return,
+            sharpe,
+            max_drawdown,
+            hit_rate,
+        )
+
     def _trading_cycle(self):
         """Single iteration: check signals for each pair and act."""
         portfolio_value = self.client.get_portfolio_value()
@@ -181,14 +264,15 @@ class TradingBot:
 
         for pair in PAIRS:
             if pair not in self.hmm_models:
+                self.logger.warning(f"  Skipping {pair}: no trained HMM available")
                 continue
 
-            self.logger.info(f"\n  ── {pair} ──")
+            self.logger.info(f"\n  -- {pair} --")
 
             # 1. Get live ticker data
             ticker = self.client.get_ticker_spread(pair)
             if ticker["spread_pct"] >= 999:
-                self.logger.warning(f"  Ticker unavailable for {pair}, skipping")
+                self.logger.warning(f"  Skipping {pair}: ticker unavailable")
                 continue
 
             self.logger.info(
@@ -226,7 +310,7 @@ class TradingBot:
 
             # 4. Check cooldown
             if self.cooldown.is_on_cooldown(pair, regime_probs):
-                self.logger.info(f"  {pair} on cooldown, skipping")
+                self.logger.info(f"  Skipping {pair}: cooldown active")
                 continue
 
             # 5. Generate signal
@@ -241,7 +325,11 @@ class TradingBot:
 
             # 6. Act on signal
             if signal["action"] == "BUY":
-                self._execute_buy(pair, ticker, regime_probs, portfolio_value, hmm)
+                buy_result = self._execute_buy(pair, ticker, regime_probs, portfolio_value, hmm)
+                if not buy_result:
+                    self.logger.info("  BUY blocked: order execution did not complete successfully")
+                elif buy_result.get("status") != "filled":
+                    self.logger.info(f"  BUY blocked: {buy_result['reason']}")
 
             elif signal["action"] == "SELL":
                 self._execute_sell(pair, ticker, signal)
@@ -264,7 +352,11 @@ class TradingBot:
 
         if mc_result["position_pct"] <= 0:
             self.logger.info(f"  MC says don't trade (position=0%)")
-            return
+            return {
+                "status": "blocked",
+                "reason": "Monte Carlo position sizing returned 0%",
+                "mc_result": mc_result,
+            }
 
         # Calculate quantity
         position_usd = mc_result["position_usd"]
@@ -279,7 +371,11 @@ class TradingBot:
 
         if quantity * price < 1.0:  # MiniOrder check
             self.logger.info(f"  Order too small: ${quantity * price:.2f} < $1.00")
-            return
+            return {
+                "status": "blocked",
+                "reason": f"Order value ${quantity * price:.2f} is below $1.00 minimum",
+                "mc_result": mc_result,
+            }
 
         self.logger.info(
             f"  BUYING {pair}: qty={quantity} (~${position_usd:,.0f}, "
@@ -297,6 +393,14 @@ class TradingBot:
             if filled_price == 0:
                 filled_price = price  # Pending limit order
             self.positions.open_position(pair, filled_price, quantity)
+            self.logger.info(f"  BUY filled at ${filled_price:,.2f}")
+            return {
+                "status": "filled",
+                "reason": "Order filled",
+                "filled_price": filled_price,
+                "quantity": quantity,
+                "mc_result": mc_result,
+            }
             self.logger.info(f"  ✓ BUY filled at ${filled_price:,.2f}")
         else:
             self.logger.error(f"  ✗ BUY failed: {result.get('ErrMsg', 'unknown')}")
@@ -339,19 +443,28 @@ class TradingBot:
         for pair in PAIRS:
             if pair not in self.last_train_time:
                 continue
-            hours_since = (datetime.utcnow() - self.last_train_time[pair]).total_seconds() / 3600
+            hours_since = (datetime.now(UTC) - self.last_train_time[pair]).total_seconds() / 3600
             if hours_since >= HMM_RETRAIN_INTERVAL_HOURS:
                 self.logger.info(f"Retraining HMM for {pair} ({hours_since:.1f}h since last)")
                 try:
                     df = load_or_fetch_historical(pair, force_refresh=True)
                     df_features = compute_features(df)
+                    if df_features.empty:
+                        self.logger.error(
+                            f"Retrain skipped for {pair}: "
+                            f"loaded {len(df)} candles, but feature engineering returned 0 rows."
+                        )
+                        continue
                     self.historical_data[pair] = df
                     self.feature_data[pair] = df_features
 
                     obs = get_hmm_observations(df_features)
+                    if len(obs) == 0:
+                        self.logger.error(f"Retrain skipped for {pair}: no HMM observations available")
+                        continue
                     self.hmm_models[pair].train(obs, pair)
                     self.hmm_models[pair].save(pair)
-                    self.last_train_time[pair] = datetime.utcnow()
+                    self.last_train_time[pair] = datetime.now(UTC)
                 except Exception as e:
                     self.logger.error(f"Retrain failed for {pair}: {e}")
 
@@ -361,11 +474,12 @@ class TradingBot:
         """Log signal details to JSONL file."""
         os.makedirs(LOG_DIR, exist_ok=True)
         entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "pair": pair,
             "action": signal["action"],
             "confidence": signal["confidence"],
             "reasons": signal["reasons"],
+            "entry_checks": signal.get("entry_checks", []),
             "regime": regime_probs,
             "features": {k: round(v, 6) if isinstance(v, float) else v
                          for k, v in features.items()},
@@ -378,7 +492,7 @@ class TradingBot:
             "position": self.positions.get(pair),
         }
         with open(LOG_SIGNALS_FILE, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+            f.write(json.dumps(entry, default=_json_default) + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -388,10 +502,41 @@ class TradingBot:
 def main():
     parser = argparse.ArgumentParser(description="HMM + Monte Carlo Crypto Trading Bot")
     parser.add_argument("--backtest", action="store_true", help="Run backtest mode")
+    parser.add_argument(
+        "--plot-metrics",
+        action="store_true",
+        help="Build a performance chart from logged signals and trades",
+    )
+    parser.add_argument(
+        "--metrics-output",
+        default=LOG_METRICS_PLOT,
+        help="Where to save the generated metrics chart",
+    )
     args = parser.parse_args()
 
     setup_logging()
     logger = logging.getLogger("Main")
+
+    if args.plot_metrics:
+        summary, output_path = build_metrics_report(logger, args.metrics_output)
+        if not summary or not output_path:
+            logger.error("Could not build metrics report.")
+            sys.exit(1)
+        logger.info(f"Metrics chart saved to {output_path}")
+        logger.info(
+            "Summary | trades=%s total_return=%s sharpe=%s sortino=%s max_drawdown=%s ic=%s hit_rate=%s",
+            summary["closed_trades"],
+            f"{summary['total_return'] * 100:.2f}%"
+            if not np.isnan(summary["total_return"]) else "n/a",
+            f"{summary['sharpe']:.2f}" if not np.isnan(summary["sharpe"]) else "n/a",
+            f"{summary['sortino']:.2f}" if not np.isnan(summary["sortino"]) else "n/a",
+            f"{summary['max_drawdown'] * 100:.2f}%"
+            if not np.isnan(summary["max_drawdown"]) else "n/a",
+            f"{summary['ic']:.2f}" if not np.isnan(summary["ic"]) else "n/a",
+            f"{summary['hit_rate'] * 100:.2f}%"
+            if not np.isnan(summary["hit_rate"]) else "n/a",
+        )
+        sys.exit(0)
 
     if args.backtest:
         logger.info("Backtest mode not yet implemented. Use live mode.")
