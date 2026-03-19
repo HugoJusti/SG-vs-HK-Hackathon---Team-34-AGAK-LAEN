@@ -196,7 +196,7 @@ class RoostooClient:
         if not balance.get("Success") and "Wallet" not in balance:
             return 0.0
 
-        wallet = balance.get("Wallet", {})
+        wallet = balance.get("SpotWallet", balance.get("Wallet", {}))
         total = 0.0
 
         # USD balance
