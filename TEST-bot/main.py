@@ -155,7 +155,7 @@ class TradingBot:
         while True:
             cycle += 1
             try:
-                self.logger.info(f"\n{'─'*40} Cycle {cycle} {'─'*40}")
+                self.logger.info(f"\n{'-'*40} Cycle {cycle} {'-'*40}")
                 self._trading_cycle()
 
             except KeyboardInterrupt:
@@ -183,7 +183,7 @@ class TradingBot:
             if pair not in self.hmm_models:
                 continue
 
-            self.logger.info(f"\n  ── {pair} ──")
+            self.logger.info(f"\n  -- {pair} --")   
 
             # 1. Get live ticker data
             ticker = self.client.get_ticker_spread(pair)
