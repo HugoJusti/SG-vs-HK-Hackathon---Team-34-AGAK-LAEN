@@ -106,7 +106,7 @@ def load_or_fetch_historical(pair: str, force_refresh: bool = False) -> pd.DataF
             logger.info(f"Using cached data for {symbol} ({len(df)} candles)")
             return df
 
-    df = fetch_binance_klines(symbol, "5m", HMM_TRAINING_HOURS * 12)
+    df = fetch_binance_klines(symbol, "5m", HMM_TRAINING_HOURS)
     if not df.empty:
         df.to_csv(cache_path, index=False)
     return df
@@ -149,8 +149,8 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df["volume_zscore"] = (df["volume"] - vol_mean) / vol_std
 
     # Moving averages (trade filters, not HMM features)
-    df["ma20"] = df["close"].rolling(window=ENTRY_MA_SHORT).mean()
-    df["ma50"] = df["close"].rolling(window=EXIT_MA_LONG).mean()
+    df["ma20"] = df["close"].ewm(span=ENTRY_MA_SHORT, adjust=False).mean()
+    df["ma50"] = df["close"].ewm(span=EXIT_MA_LONG, adjust=False).mean()
 
     # Drop NaN rows from rolling calculations
     df = df.dropna().reset_index(drop=True)
@@ -194,9 +194,14 @@ def compute_live_features(historical_df: pd.DataFrame, live_price: float,
     vol_window = volumes[-20:]
     volume_zscore = (volumes[-1] - np.mean(vol_window)) / (np.std(vol_window) + 1e-10)
 
-    # MAs
-    ma20 = np.mean(closes[-20:])
-    ma50 = np.mean(closes[-50:])
+    # EMAs (exponential moving averages)
+    alpha20 = 2 / (ENTRY_MA_SHORT + 1)
+    weights20 = np.array([(1 - alpha20) ** i for i in range(20)])[::-1]
+    ma20 = np.sum(weights20 * closes[-20:]) / np.sum(weights20)
+
+    alpha50 = 2 / (EXIT_MA_LONG + 1)
+    weights50 = np.array([(1 - alpha50) ** i for i in range(50)])[::-1]
+    ma50 = np.sum(weights50 * closes[-50:]) / np.sum(weights50)
 
     return {
         "log_return": log_return,

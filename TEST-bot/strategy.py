@@ -10,7 +10,7 @@ from config import (
     HMM_N_STATES, HMM_MODEL_DIR,
     ENTRY_HMM_CONFIDENCE, ENTRY_MAX_VOLATILITY, ENTRY_MOMENTUM_MIN,
     ENTRY_VOLUME_ZSCORE_MAX, ENTRY_MA_SHORT, ENTRY_SPREAD_MAX_PCT,
-    EXIT_HMM_CONFIDENCE, EXIT_MA_LONG, EXIT_STOP_LOSS_PCT, EXIT_TAKE_PROFIT_PCT,
+    EXIT_STOP_LOSS_PCT, EXIT_TAKE_PROFIT_PCT,
     MC_NUM_SIMULATIONS, MC_HORIZON_HOURS, MC_MAX_POSITION_PCT,
     MC_MIN_POSITION_PCT, MC_HIGH_CONFIDENCE_THRESHOLD,
     MC_LOW_CONFIDENCE_THRESHOLD, MC_TAIL_RISK_LIMIT
@@ -80,7 +80,7 @@ class RegimeHMM:
             return {"bullish": 0.33, "bearish": 0.33, "neutral": 0.34}
 
         # Use last 100 observations for context
-        recent = observations[-100:] if len(observations) > 100 else observations
+        recent = observations[-288:] if len(observations) > 288 else observations
         posteriors = self.model.predict_proba(recent)
         current = posteriors[-1]  # last time step
 
@@ -271,21 +271,7 @@ class SignalGenerator:
                     "confidence": 1.0
                 }
 
-            # MA20 structural breakdown
-            if close < features["ma20"]:
-                return {
-                    "action": "SELL",
-                    "reasons": [f"MA20 BREAKDOWN: close {close:.2f} < MA20 {features['ma20']:.2f}"],
-                    "confidence": 0.9
-                }
-
-            # HMM bearish regime
-            if regime_probs["bearish"] > EXIT_HMM_CONFIDENCE:
-                return {
-                    "action": "SELL",
-                    "reasons": [f"HMM BEARISH: P(bear)={regime_probs['bearish']:.3f} > {EXIT_HMM_CONFIDENCE}"],
-                    "confidence": regime_probs["bearish"]
-                }
+            # MA20 and HMM bearish exits disabled — relying on stop loss and take profit only
 
         # ── ENTRY LOGIC (all conditions must pass) ──
         if not has_position:
@@ -320,14 +306,13 @@ class SignalGenerator:
             spread_ok = spread_pct < ENTRY_SPREAD_MAX_PCT
             entry_checks.append(("Spread filter", spread_ok,
                                  f"spread={spread_pct:.4f}% vs {ENTRY_SPREAD_MAX_PCT}%"))
-            confluences = len(entry_checks)
-            passing = 0
-            all_pass = 0
-            for check in entry_checks :
-                passing += check[1]
-            if passing >= confluences // 2 : 
-                all_pass = 1
-            # all_pass = all(check[1] for check in entry_checks)
+            # Momentum and MA20 are mandatory
+            if not mom_ok or not ma_ok:
+                all_pass = 0
+            else:
+                # At least 2 of the remaining 4 must pass
+                remaining = [hmm_ok, vol_ok, vz_ok, spread_ok]
+                all_pass = 1 if sum(remaining) >= 2 else 0
 
             if all_pass:
                 action = "BUY"
