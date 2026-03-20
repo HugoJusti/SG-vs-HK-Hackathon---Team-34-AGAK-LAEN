@@ -10,7 +10,7 @@ from config import (
     HMM_N_STATES, HMM_MODEL_DIR,
     ENTRY_HMM_CONFIDENCE, ENTRY_MAX_VOLATILITY, ENTRY_MOMENTUM_MIN,
     ENTRY_VOLUME_ZSCORE_MAX, ENTRY_MA_SHORT, ENTRY_SPREAD_MAX_PCT,
-    EXIT_HMM_CONFIDENCE, EXIT_MA_LONG, EXIT_STOP_LOSS_PCT,
+    EXIT_HMM_CONFIDENCE, EXIT_MA_LONG, EXIT_STOP_LOSS_PCT, EXIT_TAKE_PROFIT_PCT,
     MC_NUM_SIMULATIONS, MC_HORIZON_HOURS, MC_MAX_POSITION_PCT,
     MC_MIN_POSITION_PCT, MC_HIGH_CONFIDENCE_THRESHOLD,
     MC_LOW_CONFIDENCE_THRESHOLD, MC_TAIL_RISK_LIMIT
@@ -262,11 +262,20 @@ class SignalGenerator:
                     "confidence": 1.0
                 }
 
-            # MA50 structural breakdown
-            if close < features["ma50"]:
+            # Take profit
+            gain = (close - entry_price) / entry_price
+            if gain >= EXIT_TAKE_PROFIT_PCT:
                 return {
                     "action": "SELL",
-                    "reasons": [f"MA50 BREAKDOWN: close {close:.2f} < MA50 {features['ma50']:.2f}"],
+                    "reasons": [f"TAKE PROFIT: gain {gain*100:.2f}% >= {EXIT_TAKE_PROFIT_PCT*100}%"],
+                    "confidence": 1.0
+                }
+
+            # MA20 structural breakdown
+            if close < features["ma20"]:
+                return {
+                    "action": "SELL",
+                    "reasons": [f"MA20 BREAKDOWN: close {close:.2f} < MA20 {features['ma20']:.2f}"],
                     "confidence": 0.9
                 }
 
@@ -322,10 +331,9 @@ class SignalGenerator:
 
             if all_pass:
                 action = "BUY"
-                reasons = [f"[PASS] {c[0]}: {c[2]}" for c in entry_checks]
             else:
                 action = "HOLD"
-                reasons = [f"{'[PASS]' if c[1] else '[FAIL]'} {c[0]}: {c[2]}" for c in entry_checks]
+            reasons = [f"{'[PASS]' if c[1] else '[FAIL]'} {c[0]}: {c[2]}" for c in entry_checks]
 
             return {
                 "action": action,

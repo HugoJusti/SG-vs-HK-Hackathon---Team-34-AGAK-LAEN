@@ -56,13 +56,59 @@ def setup_logging():
 # POSITION TRACKER
 # =============================================================
 
+STATE_FILE = "logs/state.json"
+
+
 class PositionTracker:
-    """Track open positions per pair."""
+    """Track open positions per pair, persisted across restarts."""
 
     def __init__(self):
         self.positions = {}
         for pair in PAIRS:
             self.positions[pair] = {"side": "none", "entry_price": 0, "quantity": 0}
+        self._load()
+
+    def _load(self):
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                saved = json.load(f)
+            self.positions.update(saved)
+            logging.getLogger("PositionTracker").info("Restored positions: %s", self.positions)
+
+    def _save(self):
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            json.dump(self.positions, f, indent=2)
+
+    def reconcile_positions(self, client):
+        """On startup, verify saved positions match actual exchange balances."""
+        logger = logging.getLogger("PositionTracker")
+        balance = client.get_balance()
+        wallet = balance.get("SpotWallet", balance.get("Wallet", {}))
+
+        for pair in PAIRS:
+            coin = pair.split("/")[0]
+            holding = wallet.get(coin, {})
+            qty = holding.get("Free", 0) + holding.get("Lock", 0)
+            saved = self.positions.get(pair, {})
+
+            if qty > 0 and saved.get("side") != "long":
+                # Exchange has coins but we have no saved position — restore it
+                ticker = client.get_ticker_spread(pair)
+                entry = ticker["last"] if ticker["last"] > 0 else 0
+                self.positions[pair] = {"side": "long", "entry_price": entry, "quantity": qty}
+                logger.warning(
+                    "Reconciled %s: found qty=%.6f on exchange with no saved position. "
+                    "Entry price set to current price $%.2f", pair, qty, entry
+                )
+            elif qty == 0 and saved.get("side") == "long":
+                # We think we have a position but exchange shows nothing
+                logger.warning(
+                    "Reconciled %s: saved position found but no coins on exchange. Clearing.", pair
+                )
+                self.positions[pair] = {"side": "none", "entry_price": 0, "quantity": 0}
+
+        self._save()
 
     def open_position(self, pair: str, entry_price: float, quantity: float):
         self.positions[pair] = {
@@ -70,9 +116,11 @@ class PositionTracker:
             "entry_price": entry_price,
             "quantity": quantity,
         }
+        self._save()
 
     def close_position(self, pair: str):
         self.positions[pair] = {"side": "none", "entry_price": 0, "quantity": 0}
+        self._save()
 
     def get(self, pair: str) -> dict:
         return self.positions.get(pair, {"side": "none", "entry_price": 0, "quantity": 0})
@@ -143,6 +191,10 @@ class TradingBot:
         balance = self.client.get_balance()
         self.logger.info("Starting balance: %s", json.dumps(balance, indent=2))
 
+        # Reconcile saved positions against actual exchange balances
+        self.positions.reconcile_positions(self.client)
+        self.logger.info("Position state after reconciliation: %s", self.positions.positions)
+
     # -- Main Loop --
 
     def run(self):
@@ -178,6 +230,40 @@ class TradingBot:
 
     def _trading_cycle(self):
         """Single iteration: check signals for each pair and act."""
+        balance = self.client.get_balance()
+        wallet = balance.get("SpotWallet", balance.get("Wallet", {}))
+        self.logger.info("--- Portfolio Snapshot ---")
+        usd = wallet.get("USD", {})
+        self.logger.info("  USD   | Free: $%-12s | Lock: $%s",
+                         f"{usd.get('Free', 0):,.2f}", f"{usd.get('Lock', 0):,.2f}")
+        # Show all coins in wallet
+        for coin, amounts in wallet.items():
+            if coin == "USD":
+                continue
+            pair = f"{coin}/USD"
+            pos = self.positions.get(pair)
+
+            # Calculate floating P&L for open positions
+            pnl_str = "N/A"
+            if pos['side'] == "long" and pos['entry_price'] > 0:
+                ticker = self.client.get_ticker_spread(pair)
+                if ticker["last"] > 0:
+                    current_price = ticker["last"]
+                    pnl_pct = (current_price - pos['entry_price']) / pos['entry_price'] * 100
+                    pnl_usd = (current_price - pos['entry_price']) * pos['quantity']
+                    pnl_str = f"{pnl_pct:+.2f}% (${pnl_usd:+,.2f})"
+
+            self.logger.info(
+                "  %-5s | Free: %-12s | Lock: %-12s | Side: %-5s | Entry: $%-12s | Qty: %-14s | PnL: %s",
+                coin,
+                f"{amounts.get('Free', 0):.6f}",
+                f"{amounts.get('Lock', 0):.6f}",
+                pos['side'],
+                f"{pos['entry_price']:,.2f}",
+                f"{pos['quantity']:.6f}",
+                pnl_str
+            )
+        self.logger.info("-" * 26)
         portfolio_value = self.client.get_portfolio_value()
         self.logger.info("Portfolio value: $%s", f"{portfolio_value:,.2f}")
 
@@ -280,10 +366,17 @@ class TradingBot:
 
         exchange_info = self.client.get_exchange_info()
         pair_info = exchange_info.get("TradePairs", {}).get(pair, {})
-        precision = pair_info.get("AmountPrecision", 6)
+        self.logger.info("  Exchange pair_info for %s: %s", pair, pair_info)
 
-        factor = 10 ** precision
-        quantity = int(quantity * factor) / factor
+        precision = pair_info.get("AmountPrecision", 6)
+        step = pair_info.get("AmountStep", None)
+
+        if step and step > 0:
+            quantity = int(quantity / step) * step
+            quantity = round(quantity, precision)
+        else:
+            factor = 10 ** precision
+            quantity = int(quantity * factor) / factor
 
         if quantity * price < 1.0:
             self.logger.info("  Order too small: $%s < $1.00", f"{quantity * price:.2f}")

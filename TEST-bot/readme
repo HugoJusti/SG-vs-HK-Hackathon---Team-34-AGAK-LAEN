@@ -1,0 +1,3 @@
+if u want to exit the position manually -> python -c "from execution import RoostooClient; c = RoostooClient(); print(c.place_order('ETH/USD', 'SELL', 1.2345))"
+if u want to check the opening position -> python -c "from execution import RoostooClient; c = RoostooClient(); print(c.get_balance())"
+if u want to exit all amount of 'X' -> c = RoostooClient(); b = c.get_balance(); print(b['SpotWallet'].get('X', {}).get('Free', 0))

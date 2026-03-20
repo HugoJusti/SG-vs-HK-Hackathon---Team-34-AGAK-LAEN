@@ -29,16 +29,17 @@ HMM_RETRAIN_INTERVAL_HOURS = 24     # retrain HMM every 24 hours
 
 # ── Entry Thresholds ─────────────────────────────────────────
 ENTRY_HMM_CONFIDENCE = 0.65     # P(bullish) must exceed this
-ENTRY_MAX_VOLATILITY = 0.50    # annualised rolling vol cap (5.5%)
+ENTRY_MAX_VOLATILITY = 0.50    # annualised rolling vol cap (50%)
 ENTRY_MOMENTUM_MIN = 0.0        # 10-period ROC must be > 0
-ENTRY_VOLUME_ZSCORE_MAX = 4.0   # |z| must be below this
+ENTRY_VOLUME_ZSCORE_MAX = 4.5   # |z| must be below this
 ENTRY_MA_SHORT = 20             # close > MA20 required
 ENTRY_SPREAD_MAX_PCT = 0.05     # bid-ask spread filter (Option B)
 
 # ── Exit Thresholds ──────────────────────────────────────────
 EXIT_HMM_CONFIDENCE = 0.60      # P(bearish) triggers exit
-EXIT_MA_LONG = 50               # close < MA50 emergency exit
+EXIT_MA_LONG = 20               # close < MA20 emergency exit
 EXIT_STOP_LOSS_PCT = 0.03       # 3% drawdown hard stop
+EXIT_TAKE_PROFIT_PCT = 0.03     # 3% gain take profit
 
 # ── Monte Carlo Position Sizing ──────────────────────────────
 MC_NUM_SIMULATIONS = 1000       # number of forward paths
@@ -50,7 +51,7 @@ MC_LOW_CONFIDENCE_THRESHOLD = 0.60    # % of paths positive → size down
 MC_TAIL_RISK_LIMIT = 0.02      # 5th percentile loss cap (2%)
 
 # ── Cooldown ─────────────────────────────────────────────────
-COOLDOWN_MIN_MINUTES = 90       # 1.5 hour minimum after exit
+COOLDOWN_MIN_MINUTES = 5       # 1.5 hour minimum after exit
 COOLDOWN_STABILITY_CHECKS = 3   # consecutive stable HMM reads needed
 COOLDOWN_STABILITY_THRESHOLD = 0.65  # regime confidence for stability
 
