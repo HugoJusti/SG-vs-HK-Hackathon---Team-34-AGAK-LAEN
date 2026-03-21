@@ -51,7 +51,7 @@ MC_LOW_CONFIDENCE_THRESHOLD = 0.60    # % of paths positive → size down
 MC_TAIL_RISK_LIMIT = 0.02      # 5th percentile loss cap (2%)
 
 # ── Cooldown ─────────────────────────────────────────────────
-COOLDOWN_MIN_MINUTES = 5       # 1.5 hour minimum after exit
+COOLDOWN_MIN_MINUTES = 5       # 5 minutes minimum after exit
 COOLDOWN_STABILITY_CHECKS = 3   # consecutive stable HMM reads needed
 COOLDOWN_STABILITY_THRESHOLD = 0.65  # regime confidence for stability
 

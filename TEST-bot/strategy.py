@@ -12,8 +12,7 @@ from config import (
     ENTRY_VOLUME_ZSCORE_MAX, ENTRY_MA_SHORT, ENTRY_SPREAD_MAX_PCT,
     EXIT_STOP_LOSS_PCT, EXIT_TAKE_PROFIT_PCT,
     MC_NUM_SIMULATIONS, MC_HORIZON_HOURS, MC_MAX_POSITION_PCT,
-    MC_MIN_POSITION_PCT, MC_HIGH_CONFIDENCE_THRESHOLD,
-    MC_LOW_CONFIDENCE_THRESHOLD, MC_TAIL_RISK_LIMIT
+    MC_MIN_POSITION_PCT, MC_TAIL_RISK_LIMIT
 )
 
 logger = logging.getLogger(__name__)
@@ -187,21 +186,13 @@ def monte_carlo_position_size(regime_params: dict, current_regime_idx: int,
     median_return = np.median(final_returns)
     tail_risk = np.percentile(final_returns, 5)
 
-    # Determine position size
+    # Determine position size — MC no longer gates trades, only sizes them
     if tail_risk < -MC_TAIL_RISK_LIMIT:
         # Tail risk too high, use minimum
         position_pct = MC_MIN_POSITION_PCT
-    elif paths_positive >= MC_HIGH_CONFIDENCE_THRESHOLD:
-        # High confidence, size up
-        position_pct = MC_MAX_POSITION_PCT
-    elif paths_positive >= MC_LOW_CONFIDENCE_THRESHOLD:
-        # Medium confidence, scale linearly
-        ratio = (paths_positive - MC_LOW_CONFIDENCE_THRESHOLD) / \
-                (MC_HIGH_CONFIDENCE_THRESHOLD - MC_LOW_CONFIDENCE_THRESHOLD)
-        position_pct = MC_MIN_POSITION_PCT + ratio * (MC_MAX_POSITION_PCT - MC_MIN_POSITION_PCT)
     else:
-        # Low confidence, don't trade
-        position_pct = 0.0
+        # Use maximum position — entry confluences already confirmed the trade
+        position_pct = MC_MAX_POSITION_PCT
 
     result = {
         "position_pct": round(position_pct, 4),
