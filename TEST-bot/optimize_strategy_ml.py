@@ -46,6 +46,7 @@ DEFAULT_PATIENCE = 20
 DEFAULT_LOOKBACK_WINDOW = 24
 DEFAULT_MIN_MOVE_THRESHOLD = 0.006
 DEFAULT_NEUTRAL_VOL_MULTIPLIER = 0.80
+DEFAULT_STARTING_CAPITAL = 10_000.0
 TARGET_CLASSES = np.array([-1, 0, 1], dtype=int)
 TARGET_LABEL_NAMES = {
     -1: "bearish",
@@ -220,6 +221,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=RANDOM_SEED,
         help="Random seed for reproducibility.",
+    )
+    parser.add_argument(
+        "--starting-capital",
+        type=float,
+        default=DEFAULT_STARTING_CAPITAL,
+        help="Starting capital used for the backtest profit simulation summary.",
     )
     return parser.parse_args()
 
@@ -828,6 +835,76 @@ def compute_risk_metrics(returns: np.ndarray) -> dict[str, float]:
     }
 
 
+def build_simulation_summary(
+    metrics: dict[str, float],
+    starting_capital: float,
+) -> dict[str, float]:
+    starting_capital = float(starting_capital)
+    total_return = float(metrics["total_return"])
+    ending_capital = starting_capital * (1.0 + total_return)
+    net_profit = ending_capital - starting_capital
+
+    return {
+        "starting_capital": starting_capital,
+        "ending_capital": float(ending_capital),
+        "net_profit": float(net_profit),
+        "profit_pct": float(total_return * 100.0),
+        "annualized_return_pct": float(metrics["annualized_return"] * 100.0),
+        "max_drawdown_pct": float(metrics["max_drawdown"] * 100.0),
+        "objective": float(metrics["objective"]),
+        "objective_raw": float(metrics["objective_raw"]),
+        "sortino_ratio": float(metrics["sortino_ratio"]),
+        "sharpe_ratio": float(metrics["sharpe_ratio"]),
+        "calmar_ratio": float(metrics["calmar_ratio"]),
+        "closed_trades": int(metrics["closed_trades"]),
+        "win_rate_pct": float(metrics["win_rate"] * 100.0),
+        "avg_trade_return_pct": float(metrics["avg_trade_return"] * 100.0),
+        "avg_holding_hours": float(metrics["avg_holding_hours"]),
+        "exposure_ratio_pct": float(metrics["exposure_ratio"] * 100.0),
+        "trade_penalty": float(metrics["trade_penalty"]),
+    }
+
+
+def build_simulation_report(
+    optimization_results: dict[str, object],
+    starting_capital: float,
+) -> dict[str, dict[str, float]]:
+    return {
+        "optimized_train": build_simulation_summary(
+            optimization_results["best_train_metrics"],
+            starting_capital,
+        ),
+        "optimized_test": build_simulation_summary(
+            optimization_results["best_test_metrics"],
+            starting_capital,
+        ),
+        "default_train": build_simulation_summary(
+            optimization_results["default_train_metrics"],
+            starting_capital,
+        ),
+        "default_test": build_simulation_summary(
+            optimization_results["default_test_metrics"],
+            starting_capital,
+        ),
+    }
+
+
+def print_simulation_summary(title: str, summary: dict[str, float]) -> None:
+    print(title)
+    print(f"  Starting capital: ${summary['starting_capital']:,.2f}")
+    print(f"  Ending capital:   ${summary['ending_capital']:,.2f}")
+    print(f"  Net profit:       ${summary['net_profit']:,.2f}")
+    print(f"  Profit:           {summary['profit_pct']:.2f}%")
+    print(f"  Annualized return:{summary['annualized_return_pct']:.2f}%")
+    print(f"  Max drawdown:     {summary['max_drawdown_pct']:.2f}%")
+    print(f"  Sortino/Sharpe/Calmar: {summary['sortino_ratio']:.4f} / {summary['sharpe_ratio']:.4f} / {summary['calmar_ratio']:.4f}")
+    print(f"  Closed trades:    {summary['closed_trades']}")
+    print(f"  Win rate:         {summary['win_rate_pct']:.2f}%")
+    print(f"  Avg trade return: {summary['avg_trade_return_pct']:.2f}%")
+    print(f"  Avg holding time: {summary['avg_holding_hours']:.2f}h")
+    print(f"  Exposure ratio:   {summary['exposure_ratio_pct']:.2f}%")
+
+
 def backtest_strategy(
     frame: pd.DataFrame,
     params: dict[str, float],
@@ -1129,8 +1206,13 @@ def save_parameter_report(
     lookback_window: int,
     min_move_threshold: float,
     neutral_vol_multiplier: float,
+    starting_capital: float,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    simulation_report = build_simulation_report(
+        optimization_results=optimization_results,
+        starting_capital=starting_capital,
+    )
     report = {
         "dataset": {
             "csv_path": str(csv_path),
@@ -1198,6 +1280,7 @@ def save_parameter_report(
         "optimized_test_metrics": optimization_results["best_test_metrics"],
         "default_train_metrics": optimization_results["default_train_metrics"],
         "default_test_metrics": optimization_results["default_test_metrics"],
+        "simulation": simulation_report,
         "search_candidates_evaluated": optimization_results["search_candidates_evaluated"],
     }
     with output_path.open("w", encoding="utf-8") as handle:
@@ -1282,6 +1365,16 @@ def main() -> None:
         lookback_window=args.lookback_window,
         min_move_threshold=args.min_move_threshold,
         neutral_vol_multiplier=args.neutral_vol_multiplier,
+        starting_capital=args.starting_capital,
+    )
+
+    optimized_test_simulation = build_simulation_summary(
+        optimization_results["best_test_metrics"],
+        args.starting_capital,
+    )
+    default_test_simulation = build_simulation_summary(
+        optimization_results["default_test_metrics"],
+        args.starting_capital,
     )
 
     print(f"Saved optimized parameters to: {params_output}")
@@ -1295,6 +1388,8 @@ def main() -> None:
     print(f"  Test accuracy:  {ml_metrics['test_accuracy']:.4f}")
     print(f"  Test balanced accuracy:  {ml_metrics['test_balanced_accuracy']:.4f}")
     print(f"  Test actionable accuracy: {ml_metrics['test_actionable_accuracy']:.4f}")
+    print_simulation_summary("Simulated optimized bot performance on test split:", optimized_test_simulation)
+    print_simulation_summary("Simulated default bot performance on test split:", default_test_simulation)
 
 
 if __name__ == "__main__":

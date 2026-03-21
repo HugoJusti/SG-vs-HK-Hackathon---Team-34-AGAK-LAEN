@@ -25,6 +25,7 @@ from optimize_strategy_ml import (
     DEFAULT_LOOKBACK_WINDOW,
     DEFAULT_MIN_MOVE_THRESHOLD,
     DEFAULT_NEUTRAL_VOL_MULTIPLIER,
+    DEFAULT_STARTING_CAPITAL,
     DEFAULT_PARAMS,
     TARGET_CLASSES,
     TARGET_LABEL_NAMES,
@@ -35,6 +36,9 @@ from optimize_strategy_ml import (
     compute_actionable_accuracy,
     sample_candidates,
     backtest_strategy,
+    build_simulation_report,
+    build_simulation_summary,
+    print_simulation_summary,
 )
 from tree_training_outputs import plot_tree_history, save_tree_history_csv
 
@@ -168,6 +172,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=RANDOM_SEED,
         help="Random seed for reproducibility.",
+    )
+    parser.add_argument(
+        "--starting-capital",
+        type=float,
+        default=DEFAULT_STARTING_CAPITAL,
+        help="Starting capital used for the backtest profit simulation summary.",
     )
     return parser.parse_args()
 
@@ -594,8 +604,13 @@ def save_tree_parameter_report(
     min_samples_leaf: int,
     top_feature_importances: list[dict[str, float]],
     history_output: Path,
+    starting_capital: float,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    simulation_report = build_simulation_report(
+        optimization_results=optimization_results,
+        starting_capital=starting_capital,
+    )
     report = {
         "dataset": {
             "csv_path": str(csv_path),
@@ -674,6 +689,7 @@ def save_tree_parameter_report(
         "optimized_test_metrics": optimization_results["best_test_metrics"],
         "default_train_metrics": optimization_results["default_train_metrics"],
         "default_test_metrics": optimization_results["default_test_metrics"],
+        "simulation": simulation_report,
         "search_candidates_evaluated": optimization_results["search_candidates_evaluated"],
     }
     with output_path.open("w", encoding="utf-8") as handle:
@@ -785,6 +801,16 @@ def main() -> None:
         min_samples_leaf=args.min_samples_leaf,
         top_feature_importances=top_feature_importances,
         history_output=history_output,
+        starting_capital=args.starting_capital,
+    )
+
+    optimized_test_simulation = build_simulation_summary(
+        optimization_results["best_test_metrics"],
+        args.starting_capital,
+    )
+    default_test_simulation = build_simulation_summary(
+        optimization_results["default_test_metrics"],
+        args.starting_capital,
     )
 
     print(f"Saved optimized parameters to: {params_output}")
@@ -799,6 +825,8 @@ def main() -> None:
     print(f"  Test accuracy:  {tree_metrics['test_accuracy']:.4f}")
     print(f"  Test balanced accuracy: {tree_metrics['test_balanced_accuracy']:.4f}")
     print(f"  Test actionable accuracy: {tree_metrics['test_actionable_accuracy']:.4f}")
+    print_simulation_summary("Simulated optimized bot performance on test split:", optimized_test_simulation)
+    print_simulation_summary("Simulated default bot performance on test split:", default_test_simulation)
 
 
 if __name__ == "__main__":
