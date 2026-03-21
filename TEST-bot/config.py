@@ -24,14 +24,14 @@ HMM_FEATURES = [                # observation features fed to HMM
     "volume_zscore",
 ]
 # HMM_TRAINING_HOURS = 2 * 365 * 24   # ~2 years of hourly data
-HMM_TRAINING_HOURS = 6 * 30 * 24    # 6 months
+HMM_TRAINING_HOURS = 1 * 30 * 24    # 1 month
 HMM_RETRAIN_INTERVAL_HOURS = 24     # retrain HMM every 24 hours
 
 # ── Entry Thresholds ─────────────────────────────────────────
-ENTRY_HMM_CONFIDENCE = 0.65     # P(bullish) must exceed this
-ENTRY_MAX_VOLATILITY = 0.50    # annualised rolling vol cap (50%)
-ENTRY_MOMENTUM_MIN = 0.0        # 10-period ROC must be > 0
-ENTRY_VOLUME_ZSCORE_MAX = 4.5   # |z| must be below this
+ENTRY_HMM_CONFIDENCE = 0.59     # P(bullish) must exceed this
+ENTRY_MAX_VOLATILITY = 0.66    # annualised rolling vol cap (50%)
+ENTRY_MOMENTUM_MIN = 0.0181        # 10-period ROC must be > 0
+ENTRY_VOLUME_ZSCORE_MAX = 4.28   # |z| must be below this
 ENTRY_MA_SHORT = 20             # close > MA20 required
 ENTRY_SPREAD_MAX_PCT = 0.05     # bid-ask spread filter (Option B)
 
