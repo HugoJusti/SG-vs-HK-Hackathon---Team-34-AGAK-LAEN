@@ -9,7 +9,7 @@ from hmmlearn.hmm import GaussianHMM
 from config import (
     HMM_N_STATES, HMM_MODEL_DIR,
     ENTRY_HMM_CONFIDENCE, ENTRY_MAX_VOLATILITY, ENTRY_MOMENTUM_MIN,
-    ENTRY_VOLUME_ZSCORE_MAX, ENTRY_MA_SHORT, ENTRY_SPREAD_MAX_PCT,
+    ENTRY_VOLUME_ZSCORE_MAX, ENTRY_MA_SHORT, ENTRY_MA_BUFFER_PCT, ENTRY_SPREAD_MAX_PCT,
     EXIT_HMM_CONFIDENCE, EXIT_MA_LONG, EXIT_STOP_LOSS_PCT,
     MC_NUM_SIMULATIONS, MC_HORIZON_HOURS, MC_MAX_POSITION_PCT,
     MC_MIN_POSITION_PCT, MC_HIGH_CONFIDENCE_THRESHOLD,
@@ -325,12 +325,16 @@ class SignalGenerator:
                 "detail": f"|z|={abs(features['volume_zscore']):.3f} vs {ENTRY_VOLUME_ZSCORE_MAX}",
             })
 
-            # 5. MA20 confirmation
-            ma_ok = close > features["ma20"]
+            # 5. Short-MA confirmation with a small tolerance buffer
+            ma_threshold = features["ma20"] * (1 - ENTRY_MA_BUFFER_PCT)
+            ma_ok = close >= ma_threshold
             entry_checks.append({
-                "name": "MA20 confirm",
+                "name": f"MA{ENTRY_MA_SHORT} confirm",
                 "passed": ma_ok,
-                "detail": f"close={close:.2f} vs MA20={features['ma20']:.2f}",
+                "detail": (
+                    f"close={close:.2f} vs MA{ENTRY_MA_SHORT}={features['ma20']:.2f} "
+                    f"(pass if >= {ma_threshold:.2f})"
+                ),
             })
 
             # 6. Spread filter (Option B — not in HMM, just a gate)

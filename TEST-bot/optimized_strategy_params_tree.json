@@ -1,0 +1,279 @@
+{
+  "dataset": {
+    "csv_path": "C:\\Users\\keena\\Downloads\\HKU\\Hackathon\\SG-vs-HK-Hackathon---Team-34-AGAK-LAEN\\TEST-bot\\binance_data.csv",
+    "rows_after_feature_engineering": 17436,
+    "train_rows": 13948,
+    "test_rows": 3488,
+    "target_horizon_hours": 12,
+    "lookback_window_hours": 24,
+    "overall_target_distribution": {
+      "bearish": 3294,
+      "neutral": 10785,
+      "bullish": 3357
+    },
+    "train_target_distribution": {
+      "bearish": 2554,
+      "neutral": 8670,
+      "bullish": 2724
+    },
+    "validation_target_distribution": {
+      "bearish": 512,
+      "neutral": 1705,
+      "bullish": 573
+    },
+    "test_target_distribution": {
+      "bearish": 740,
+      "neutral": 2115,
+      "bullish": 633
+    }
+  },
+  "model": {
+    "type": "GradientBoostingClassifier",
+    "feature_count": 432,
+    "base_sequence_features": [
+      "log_return",
+      "return_3",
+      "return_6",
+      "return_12",
+      "rolling_vol_6",
+      "rolling_vol_20",
+      "rolling_vol_48",
+      "momentum_10",
+      "rsi_14",
+      "atr_pct_14",
+      "macd_hist",
+      "bollinger_z_20",
+      "volume_zscore_20",
+      "close_to_ma20",
+      "close_to_ma50",
+      "ma_gap_20_50",
+      "intrabar_range_pct",
+      "candle_body_pct"
+    ],
+    "n_estimators_requested": 300,
+    "best_iteration": 157,
+    "early_stop_iteration": 38,
+    "patience": 20,
+    "learning_rate": 0.05,
+    "max_depth": 3,
+    "subsample": 0.8,
+    "min_samples_leaf": 20,
+    "selection_train_accuracy": 0.6832765728625202,
+    "selection_train_balanced_accuracy": 0.7182579890057381,
+    "selection_train_loss": 0.8609332504868916,
+    "selection_validation_loss": 1.0981606266700583,
+    "best_validation_accuracy": 0.407168458781362,
+    "best_validation_balanced_accuracy": 0.3994769502468529,
+    "full_train_accuracy": 0.6457556638944651,
+    "full_train_balanced_accuracy": 0.6780143497914338,
+    "full_train_loss": 0.8954065640011405,
+    "full_train_actionable_accuracy": 0.7142857142857143,
+    "test_accuracy": 0.46215596330275227,
+    "test_balanced_accuracy": 0.4083243877133158,
+    "test_loss": 1.0323848833111733,
+    "test_actionable_accuracy": 0.33576110706482154,
+    "training_class_distribution": {
+      "bearish": 2042,
+      "neutral": 6965,
+      "bullish": 2151
+    },
+    "train_full_class_distribution": {
+      "bearish": 2554,
+      "neutral": 8670,
+      "bullish": 2724
+    },
+    "top_feature_importances": [
+      {
+        "feature": "rolling_vol_20_lag_0",
+        "importance": 0.040426151291227404
+      },
+      {
+        "feature": "rolling_vol_48_lag_0",
+        "importance": 0.02549928293316888
+      },
+      {
+        "feature": "rolling_vol_48_lag_23",
+        "importance": 0.025438878577919547
+      },
+      {
+        "feature": "rolling_vol_20_lag_2",
+        "importance": 0.016934504295645723
+      },
+      {
+        "feature": "atr_pct_14_lag_0",
+        "importance": 0.015719905077703333
+      },
+      {
+        "feature": "rolling_vol_20_lag_3",
+        "importance": 0.01354495415211263
+      },
+      {
+        "feature": "rolling_vol_48_lag_2",
+        "importance": 0.013189306356274876
+      },
+      {
+        "feature": "rolling_vol_20_lag_1",
+        "importance": 0.012749656104314184
+      },
+      {
+        "feature": "rolling_vol_48_lag_21",
+        "importance": 0.01176508413094294
+      },
+      {
+        "feature": "rolling_vol_20_lag_23",
+        "importance": 0.011704552580648259
+      },
+      {
+        "feature": "close_to_ma50_lag_0",
+        "importance": 0.011180071560248285
+      },
+      {
+        "feature": "rolling_vol_48_lag_22",
+        "importance": 0.011063641320496146
+      },
+      {
+        "feature": "rolling_vol_48_lag_3",
+        "importance": 0.010086844965872827
+      },
+      {
+        "feature": "ma_gap_20_50_lag_9",
+        "importance": 0.0096030946903058
+      },
+      {
+        "feature": "rolling_vol_6_lag_0",
+        "importance": 0.00932920150463693
+      },
+      {
+        "feature": "ma_gap_20_50_lag_23",
+        "importance": 0.009057171769174824
+      },
+      {
+        "feature": "macd_hist_lag_23",
+        "importance": 0.00889007715530765
+      },
+      {
+        "feature": "volume_zscore_20_lag_0",
+        "importance": 0.008566106619720586
+      },
+      {
+        "feature": "rolling_vol_48_lag_1",
+        "importance": 0.00851491626531202
+      },
+      {
+        "feature": "rolling_vol_48_lag_20",
+        "importance": 0.008402895441850156
+      }
+    ]
+  },
+  "objective_weights": {
+    "sortino_ratio": 0.4,
+    "sharpe_ratio": 0.3,
+    "calmar_ratio": 0.3
+  },
+  "target_definition": {
+    "classes": {
+      "-1": "bearish",
+      "0": "neutral",
+      "1": "bullish"
+    },
+    "minimum_move_threshold": 0.006,
+    "neutral_volatility_multiplier": 0.8,
+    "rule": "bullish if future_return > max(min_move_threshold, hourly_vol * sqrt(horizon) * neutral_volatility_multiplier); bearish if future_return < -that threshold; otherwise neutral"
+  },
+  "assumptions": {
+    "confidence_source": "ENTRY_HMM_CONFIDENCE and EXIT_HMM_CONFIDENCE are optimized against tree-model bullish and bearish class probabilities from a 3-class bull/neutral/bear model.",
+    "spread_proxy": "The CSV has no bid/ask spread, so estimated_spread_pct uses 5% of the 3-candle median intrabar range in percentage points.",
+    "positioning": "Long-only, one position at a time, using close-to-close returns.",
+    "cost_model": "Half of the synthetic spread is charged on entry and exit."
+  },
+  "artifacts": {
+    "training_history_csv": "C:\\Users\\keena\\Downloads\\HKU\\Hackathon\\SG-vs-HK-Hackathon---Team-34-AGAK-LAEN\\TEST-bot\\tree_training_history.csv"
+  },
+  "default_parameters": {
+    "ENTRY_HMM_CONFIDENCE": 0.65,
+    "ENTRY_MAX_VOLATILITY": 0.055,
+    "ENTRY_MOMENTUM_MIN": 0.0,
+    "ENTRY_VOLUME_ZSCORE_MAX": 2.0,
+    "ENTRY_MA_SHORT": 20,
+    "ENTRY_SPREAD_MAX_PCT": 0.05,
+    "EXIT_HMM_CONFIDENCE": 0.6,
+    "EXIT_MA_LONG": 50,
+    "EXIT_STOP_LOSS_PCT": 0.03
+  },
+  "optimized_parameters": {
+    "ENTRY_HMM_CONFIDENCE": 0.2841,
+    "ENTRY_MAX_VOLATILITY": 0.1982,
+    "ENTRY_MOMENTUM_MIN": -0.0367,
+    "ENTRY_VOLUME_ZSCORE_MAX": 1.5237,
+    "ENTRY_MA_SHORT": 20,
+    "ENTRY_SPREAD_MAX_PCT": 0.0493,
+    "EXIT_HMM_CONFIDENCE": 0.3981,
+    "EXIT_STOP_LOSS_PCT": 0.043,
+    "EXIT_MA_LONG": 46
+  },
+  "optimized_train_metrics": {
+    "objective_raw": 5.9050777237666265,
+    "sortino_ratio": 6.765527974419451,
+    "sharpe_ratio": 3.321818610498379,
+    "calmar_ratio": 7.341069836164441,
+    "annualized_return": 0.2991076860645734,
+    "max_drawdown": -0.04074442727558236,
+    "total_return": 0.5168759533020919,
+    "objective": 5.9050777237666265,
+    "trade_penalty": 0.0,
+    "closed_trades": 164,
+    "win_rate": 0.43902439024390244,
+    "avg_trade_return": 0.0026599155822016195,
+    "avg_holding_hours": 5.548780487804878,
+    "exposure_ratio": 0.06524700652470065
+  },
+  "optimized_test_metrics": {
+    "objective_raw": 1.752759276458535,
+    "sortino_ratio": 1.9323316386616989,
+    "sharpe_ratio": 1.2368492198031604,
+    "calmar_ratio": 2.029239516843024,
+    "annualized_return": 0.07073883479434029,
+    "max_drawdown": -0.03485977589495781,
+    "total_return": 0.02758842882997059,
+    "objective": 1.752759276458535,
+    "trade_penalty": 0.0,
+    "closed_trades": 25,
+    "win_rate": 0.28,
+    "avg_trade_return": 0.0011325467603592013,
+    "avg_holding_hours": 6.56,
+    "exposure_ratio": 0.04703183252079151
+  },
+  "default_train_metrics": {
+    "objective_raw": 0.0,
+    "sortino_ratio": 0.0,
+    "sharpe_ratio": 0.0,
+    "calmar_ratio": 0.0,
+    "annualized_return": 0.0,
+    "max_drawdown": 0.0,
+    "total_return": 0.0,
+    "objective": -0.8999999999999999,
+    "trade_penalty": 0.8999999999999999,
+    "closed_trades": 0,
+    "win_rate": 0.0,
+    "avg_trade_return": 0.0,
+    "avg_holding_hours": 0.0,
+    "exposure_ratio": 0.0
+  },
+  "default_test_metrics": {
+    "objective_raw": 0.0,
+    "sortino_ratio": 0.0,
+    "sharpe_ratio": 0.0,
+    "calmar_ratio": 0.0,
+    "annualized_return": 0.0,
+    "max_drawdown": 0.0,
+    "total_return": 0.0,
+    "objective": -0.8999999999999999,
+    "trade_penalty": 0.8999999999999999,
+    "closed_trades": 0,
+    "win_rate": 0.0,
+    "avg_trade_return": 0.0,
+    "avg_holding_hours": 0.0,
+    "exposure_ratio": 0.0
+  },
+  "search_candidates_evaluated": 300
+}

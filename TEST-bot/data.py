@@ -178,8 +178,9 @@ def compute_live_features(historical_df: pd.DataFrame, live_price: float,
     Given the recent historical DataFrame and a new live price/volume,
     compute current feature values for signal checking.
     """
-    closes = list(historical_df["close"].values[-50:]) + [live_price]
-    volumes = list(historical_df["volume"].values[-50:]) + [live_volume]
+    history_window = max(EXIT_MA_LONG, ENTRY_MA_SHORT, 21)
+    closes = list(historical_df["close"].values[-history_window:]) + [live_price]
+    volumes = list(historical_df["volume"].values[-history_window:]) + [live_volume]
 
     closes = np.array(closes)
     volumes = np.array(volumes)
@@ -199,8 +200,8 @@ def compute_live_features(historical_df: pd.DataFrame, live_price: float,
     volume_zscore = (volumes[-1] - np.mean(vol_window)) / (np.std(vol_window) + 1e-10)
 
     # MAs
-    ma20 = np.mean(closes[-20:])
-    ma50 = np.mean(closes[-50:])
+    ma20 = np.mean(closes[-ENTRY_MA_SHORT:])
+    ma50 = np.mean(closes[-EXIT_MA_LONG:])
 
     return {
         "log_return": log_return,

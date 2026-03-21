@@ -27,19 +27,20 @@ HMM_TRAINING_HOURS = 2 * 365 * 24   # ~2 years of hourly data
 HMM_RETRAIN_INTERVAL_HOURS = 24     # retrain HMM every 24 hours
 
 # ── Entry Thresholds ─────────────────────────────────────────
-ENTRY_HMM_CONFIDENCE = 0.65     # P(bullish) must exceed this
-ENTRY_MAX_VOLATILITY = 0.055    # annualised rolling vol cap (5.5%)
-ENTRY_MOMENTUM_MIN = 0.0        # 10-period ROC must be > 0
-ENTRY_VOLUME_ZSCORE_MAX = 2.0   # |z| must be below this
-ENTRY_MA_SHORT = 20             # close > MA20 required
-ENTRY_SPREAD_MAX_PCT = 0.05     # bid-ask spread filter (Option B)
-
 # ENTRY_HMM_CONFIDENCE = 0.65     # P(bullish) must exceed this
-# ENTRY_MAX_VOLATILITY = 0.30    # annualised rolling vol cap (5.5%)
-# ENTRY_MOMENTUM_MIN = 0.02        # 10-period ROC must be > 0
-# ENTRY_VOLUME_ZSCORE_MAX = 5.0   # |z| must be below this
-# ENTRY_MA_SHORT = 67676             # close > MA20 required
+# ENTRY_MAX_VOLATILITY = 0.055    # annualised rolling vol cap (5.5%)
+# ENTRY_MOMENTUM_MIN = 0.0        # 10-period ROC must be > 0
+# ENTRY_VOLUME_ZSCORE_MAX = 2.0   # |z| must be below this
+# ENTRY_MA_SHORT = 20             # close > MA20 required
 # ENTRY_SPREAD_MAX_PCT = 0.05     # bid-ask spread filter (Option B)
+
+ENTRY_HMM_CONFIDENCE = 0.0     # P(bullish) must exceed this
+ENTRY_MAX_VOLATILITY = 0.9    # annualised rolling vol cap (5.5%)
+ENTRY_MOMENTUM_MIN = -0.03        # 10-period ROC must be > 0
+ENTRY_VOLUME_ZSCORE_MAX = 5.0   # |z| must be below this
+ENTRY_MA_SHORT = 10             # short MA window for entry confirmation
+ENTRY_MA_BUFFER_PCT = 0.03      # allow price to be up to 3% below the short MA
+ENTRY_SPREAD_MAX_PCT = 0.05     # bid-ask spread filter (Option B)
 
 # ── Exit Thresholds ──────────────────────────────────────────
 EXIT_HMM_CONFIDENCE = 0.60      # P(bearish) triggers exit

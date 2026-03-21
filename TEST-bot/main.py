@@ -15,6 +15,7 @@ import json
 import logging
 import argparse
 import numpy as np
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from datetime import UTC, datetime, timedelta
 
 from config import (
@@ -126,6 +127,7 @@ class TradingBot:
         self.historical_data = {}
         self.feature_data = {}
         self.last_train_time = {}
+        self.exchange_info = {}
         self.metrics_enabled = ENABLE_METRICS_REPORTING
 
         self.logger = logging.getLogger("Bot")
@@ -145,6 +147,7 @@ class TradingBot:
 
         exchange_info = self.client.get_exchange_info()
         if exchange_info:
+            self.exchange_info = exchange_info
             available = list(exchange_info.get("TradePairs", {}).keys())
             self.logger.info(f"Available pairs: {available}")
 
@@ -218,6 +221,80 @@ class TradingBot:
                 f"Sleeping {POLL_INTERVAL_SEC}s..."
             )
             time.sleep(POLL_INTERVAL_SEC)
+
+    def _get_pair_quantity_constraints(self, pair: str) -> tuple[Decimal | None, int | None]:
+        """Best-effort extraction of quantity step size or precision from exchange info."""
+        trade_pairs = self.exchange_info.get("TradePairs", {}) if isinstance(self.exchange_info, dict) else {}
+        pair_info = trade_pairs.get(pair, {}) if isinstance(trade_pairs, dict) else {}
+
+        step_candidates = [
+            "QuantityStepSize",
+            "QtyStepSize",
+            "stepSize",
+            "StepSize",
+            "LotSize",
+            "lotSize",
+            "MinTradeQuantity",
+            "MinOrderQuantity",
+            "MinQty",
+            "minQty",
+        ]
+        precision_candidates = [
+            "QuantityScale",
+            "QtyScale",
+            "BaseAssetPrecision",
+            "baseAssetPrecision",
+            "quantityPrecision",
+            "QuantityPrecision",
+            "qtyPrecision",
+        ]
+
+        step_size = None
+        for key in step_candidates:
+            value = pair_info.get(key)
+            if value in (None, "", 0, "0"):
+                continue
+            try:
+                parsed = Decimal(str(value))
+                if parsed > 0:
+                    step_size = parsed
+                    break
+            except (InvalidOperation, ValueError):
+                continue
+
+        precision = None
+        for key in precision_candidates:
+            value = pair_info.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                precision = int(value)
+                break
+            except (TypeError, ValueError):
+                continue
+
+        return step_size, precision
+
+    def _quantize_quantity(self, pair: str, quantity: float) -> float:
+        """
+        Snap quantity down to an allowed step size.
+        Falls back to a conservative per-asset decimal precision if exchange
+        metadata is unavailable.
+        """
+        raw_qty = Decimal(str(quantity))
+        step_size, precision = self._get_pair_quantity_constraints(pair)
+
+        if step_size is not None:
+            steps = (raw_qty / step_size).to_integral_value(rounding=ROUND_DOWN)
+            quantized = steps * step_size
+            return float(quantized)
+
+        if precision is None:
+            coin = pair.split("/")[0]
+            precision = 3 if coin == "BTC" else 2 if coin == "ETH" else 4
+
+        quant = Decimal("1").scaleb(-precision)
+        return float(raw_qty.quantize(quant, rounding=ROUND_DOWN))
 
     def _refresh_metrics(self, cycle: int, force: bool = False):
         """Refresh the saved metrics chart from the latest bot logs."""
@@ -361,13 +438,12 @@ class TradingBot:
         # Calculate quantity
         position_usd = mc_result["position_usd"]
         price = ticker["ask"]  # worst-case for buys
-        coin = pair.split("/")[0]
+        raw_quantity = position_usd / price
+        quantity = self._quantize_quantity(pair, raw_quantity)
 
-        # Get precision from exchange info
-        quantity = position_usd / price
-        # Round to reasonable precision (6 for BTC, 4 for ETH)
-        precision = 6 if coin == "BTC" else 4
-        quantity = round(quantity, precision)
+        self.logger.info(
+            f"  Quantity normalised for {pair}: raw={raw_quantity:.10f} -> order={quantity:.10f}"
+        )
 
         if quantity * price < 1.0:  # MiniOrder check
             self.logger.info(f"  Order too small: ${quantity * price:.2f} < $1.00")
