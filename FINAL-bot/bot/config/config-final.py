@@ -13,7 +13,7 @@ SECRET_KEY = os.getenv("RST_SECRET_KEY", "YOUR_SECRET_KEY_HERE")
 BASE_URL = "https://mock-api.roostoo.com"
 
 # ── Trading Pairs ────────────────────────────────────────────
-PAIRS = ["BTC/USD", "ETH/USD", "ZEC/USD"]
+PAIRS = ["BTC/USD", "ETH/USD"]
 
 # ── HMM Settings ─────────────────────────────────────────────
 HMM_N_STATES = 3                # bullish, bearish, neutral
