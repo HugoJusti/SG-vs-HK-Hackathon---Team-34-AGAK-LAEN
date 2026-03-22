@@ -27,18 +27,18 @@ HMM_TRAINING_HOURS = 1 * 30 * 24    # 1 month
 HMM_RETRAIN_INTERVAL_HOURS = 24     # retrain HMM every 24 hours
 
 # ── Entry Thresholds ─────────────────────────────────────────
-ENTRY_HMM_CONFIDENCE = 0.59     # P(bullish) must exceed this
-ENTRY_MAX_VOLATILITY = 0.66     # annualised rolling vol cap
-ENTRY_MOMENTUM_MIN = 0.0181     # 10-period ROC must be > this
-ENTRY_VOLUME_ZSCORE_MAX = 4.28  # |z| must be below this
+ENTRY_HMM_CONFIDENCE = 0.494     # P(bullish) must exceed this
+ENTRY_MAX_VOLATILITY = 0.1997     # annualised rolling vol cap
+ENTRY_MOMENTUM_MIN = -0.0346     # 10-period ROC must be > this
+ENTRY_VOLUME_ZSCORE_MAX = 4.5283  # |z| must be below this
 ENTRY_MA_SHORT = 20             # close > EMA20 required
-ENTRY_SPREAD_MAX_PCT = 0.05     # bid-ask spread filter
+ENTRY_SPREAD_MAX_PCT = 0.0362     # bid-ask spread filter
 
 # ── Exit Thresholds ──────────────────────────────────────────
-EXIT_HMM_CONFIDENCE = 0.60      # unused — kept for reference
+EXIT_HMM_CONFIDENCE = 0.6087      # unused — kept for reference
 EXIT_MA_LONG = 20               # unused — kept for reference
-EXIT_STOP_LOSS_PCT = 0.03       # 3% drawdown hard stop
-EXIT_TAKE_PROFIT_PCT = 0.03     # 3% gain take profit
+EXIT_STOP_LOSS_PCT = 0.007      # 0.7% drawdown hard stop
+EXIT_TAKE_PROFIT_PCT = 0.007    # 0.7% gain take profit
 
 # ── Monte Carlo Position Sizing ──────────────────────────────
 MC_NUM_SIMULATIONS = 1000       # number of forward paths
