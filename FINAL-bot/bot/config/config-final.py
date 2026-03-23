@@ -31,7 +31,7 @@ ENTRY_HMM_CONFIDENCE = 0.494     # P(bullish) must exceed this
 ENTRY_MAX_VOLATILITY = 0.1997     # annualised rolling vol cap
 ENTRY_MOMENTUM_MIN = -0.0346     # 10-period ROC must be > this
 ENTRY_VOLUME_ZSCORE_MAX = 4.5283  # |z| must be below this
-ENTRY_MA_SHORT = 5             # close > EMA20 required
+ENTRY_MA_SHORT = 8             # close > EMA8 required
 ENTRY_SPREAD_MAX_PCT = 0.0362     # bid-ask spread filter
 
 # ── Exit Thresholds ──────────────────────────────────────────
