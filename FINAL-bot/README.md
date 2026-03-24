@@ -34,7 +34,7 @@ Finally, we then run a Monte Carlo simulation for the bot to decide to enter tra
 ## 2. Architecture
 -----------------------------------
 ### System design diagram:
-![Bot Flow Diagram](Diagram - V1.png)
+![Bot Flow Diagram](Diagram-V1.png)
 
 ### Components:
 - **data.py** – fetches and stores market data into csv files
