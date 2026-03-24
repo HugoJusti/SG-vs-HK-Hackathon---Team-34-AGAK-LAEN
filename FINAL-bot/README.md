@@ -9,19 +9,17 @@ This project aims to build an automated crypto trading bot for the Roostoo Quant
 ----------------------
 - ENTRY_HMM_CONFIDENCE 
 - ENTRY_MAX_VOLATILITY
-- ENTRY_MOMENTUM_MIN
+- ENTRY_MOMENTUM_MIN (HAS to PASS)
 - ENTRYVOLUME_ZSCORE_MAX
-- ENTRY_MA_SHORT
+- ENTRY_MA_SHORT (HAS to PASS)
 - ENTRY_SPREAD_MAX_PCT
 
 ### Exit Thresholds:
 ----------------------
-- EXIT_HMM_CONFIDENCE 
-- EXIT_MA_LONG
-- EXIT_STOP_LOSS_PCT
-- EXIT_TAKE_PROFIT_PCT
+- GAIN >= 0.7%
+- DRAWDOEN >= 0.7%
 
-Note: These variables values are subjected to change based on a Machine Learning (ML) model we test and market conditions, All these variables also don't need to pass for the bot to Enter or Exit (We weight the variables based on how important they are). 
+Note: These variables values are subjected to change based on a Machine Learning (ML) model we test and market conditions, All these variables also don't need to pass for the bot to Enter (We weight the variables based on how important they are). 
 
 Finally, we then run a Monte Carlo simulation for the bot to decide to enter trade with 5%-30% portfolio value with the maximum value of losing profit or getting profit capped at 3%
 
@@ -36,7 +34,7 @@ Finally, we then run a Monte Carlo simulation for the bot to decide to enter tra
 ## 2. Architecture
 -----------------------------------
 ### System design diagram:
--Still Work in Progress
+![Bot Flow Diagram](Diagram - V1.png)
 
 ### Components:
 - **data.py** – fetches and stores market data into csv files
@@ -60,21 +58,21 @@ Finally, we then run a Monte Carlo simulation for the bot to decide to enter tra
 
 ### Entry Conditions:
 Two conditions are **mandatory** — if either fails, no trade is placed:
-- **Momentum > 0.0181** (10-period Rate of Change): price must be trending upward
-- **Price > EMA20**: price must be above the 20-period exponential moving average
+- **Momentum > -0.0346** (10-period Rate of Change): price must be trending upward
+- **Price > EMA8**: price must be above the 20-period exponential moving average
 
 In addition, **at least 2 of the following 4** must also pass:
-- **HMM bullish confidence > 0.59**: the Hidden Markov Model classifies current regime as bullish
-- **Annualised rolling volatility < 0.66**: market is not too volatile to trade
-- **Volume z-score |z| < 4.28**: no abnormal volume spike (avoids manipulation candles)
-- **Bid-ask spread < 0.05%**: market is liquid enough for clean execution
+- **HMM bullish confidence > 0.494**: the Hidden Markov Model classifies current regime as bullish
+- **Annualised rolling volatility < 0.1997**: market is not too volatile to trade
+- **Volume z-score |z| < 4.5283**: no abnormal volume spike (avoids manipulation candles)
+- **Bid-ask spread < 0.0362**: market is liquid enough for clean execution
 
 ### Exit Conditions:
 Positions are exited under two hard rules (whichever triggers first):
-- **Stop Loss**: close price drops 3% below entry price
-- **Take Profit**: close price rises 3% above entry price
+- **Stop Loss**: close price drops 0.7% below entry price
+- **Take Profit**: close price rises 0.7% above entry price
 
-There are no indicator-based exits — every trade is purely bounded by the 3% SL/TP brackets.
+There are no indicator-based exits — every trade is purely bounded by the 0.7% SL/TP brackets.
 
 ### Position Sizing Logic:
 A **Monte Carlo simulation** (1000 paths, 24-hour horizon) is run using the HMM regime parameters to estimate forward return distribution:
@@ -92,7 +90,7 @@ Monte Carlo only sizes the trade — it does not block entry.
 ### Assumptions Made:
 - Binance 5-minute OHLCV data is a reasonable proxy for training the HMM on market regimes, even though live trading runs on Roostoo
 - A 1-month training window keeps the HMM relevant to recent market conditions
-- 3% SL/TP is appropriate for short-term 5-minute timeframe trades in a 7-day competition
+- 0.7% SL/TP is appropriate for short-term 5-minute timeframe trades in a 7-day competition
 
 ## 4. Setup instructions & How to run Bot
 -----------------------------------
