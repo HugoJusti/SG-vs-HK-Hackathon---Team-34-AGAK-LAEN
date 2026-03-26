@@ -13,7 +13,7 @@ SECRET_KEY = os.getenv("RST_SECRET_KEY", "YOUR_SECRET_KEY_HERE")
 BASE_URL = "https://mock-api.roostoo.com"
 
 # ── Trading Pairs ────────────────────────────────────────────
-PAIRS = ["BTC/USD", "ETH/USD"]
+PAIRS = ["BTC/USD", "ETH/USD", "SOL/USD", "BNB/USD"]
 
 # ── HMM Settings ─────────────────────────────────────────────
 HMM_N_STATES = 3                # bullish, bearish, neutral
@@ -23,7 +23,7 @@ HMM_FEATURES = [                # observation features fed to HMM
     "momentum",
     "volume_zscore",
 ]
-HMM_TRAINING_HOURS = 1 * 30 * 24    # 1 month
+HMM_TRAINING_HOURS = 1 * 60 * 24    # 2 month
 HMM_RETRAIN_INTERVAL_HOURS = 24     # retrain HMM every 24 hours
 
 # ── Entry Thresholds ─────────────────────────────────────────

@@ -3,7 +3,7 @@
 ### High-Level Ideas
 This project aims to build an automated crypto trading bot for the Roostoo Quant Hackathon using quantitative signals to identify trading opportunities and execute trades systematically. The bot is designed with a modular structure so data collection, strategy, logic, execution, and logging can be developed and improved independently.
 
-### Strategy: Make a Hidden Markov Model (HMM) based on data grabbed from Binance from current market conditions (a month past) to keep the bot relevant, then setting up Entry and Exit Threshold variables for both BTC and ETH to generate entry/exit/hold signals:
+### Strategy: Make a Hidden Markov Model (HMM) based on data grabbed from Binance from current market conditions (a month past) to keep the bot relevant, then setting up Entry and Exit Threshold variables for BTC, ETH, SOL, and BNB to generate entry/exit/hold signals:
 
 ### Entry Thresholds:
 ----------------------
