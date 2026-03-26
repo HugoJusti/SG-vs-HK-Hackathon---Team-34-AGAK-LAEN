@@ -237,6 +237,10 @@ class TradingBot:
         """Single iteration: check signals for each pair and act."""
         balance = self.client.get_balance()
         wallet = balance.get("SpotWallet", balance.get("Wallet", {}))
+
+        # Pre-fetch all tickers once and reuse throughout the cycle
+        ticker_cache = {pair: self.client.get_ticker_spread(pair) for pair in PAIRS}
+
         self.logger.info("--- Portfolio Snapshot ---")
         usd = wallet.get("USD", {})
         self.logger.info("  USD   | Free: $%-12s | Lock: $%s",
@@ -250,7 +254,7 @@ class TradingBot:
 
             pnl_str = "N/A"
             if pos['side'] == "long" and pos['entry_price'] > 0:
-                ticker = self.client.get_ticker_spread(pair)
+                ticker = ticker_cache.get(pair) or self.client.get_ticker_spread(pair)
                 if ticker["last"] > 0:
                     current_price = ticker["last"]
                     pnl_pct = (current_price - pos['entry_price']) / pos['entry_price'] * 100
@@ -269,7 +273,16 @@ class TradingBot:
             )
         self.logger.info("-" * 26)
 
-        portfolio_value = self.client.get_portfolio_value()
+        # Calculate portfolio value from already-fetched wallet + ticker cache
+        portfolio_value = usd.get("Free", 0) + usd.get("Lock", 0)
+        for coin, amounts in wallet.items():
+            if coin == "USD":
+                continue
+            holding = amounts.get("Free", 0) + amounts.get("Lock", 0)
+            if holding > 0:
+                t = ticker_cache.get(f"{coin}/USD") or self.client.get_ticker_spread(f"{coin}/USD")
+                if t and t["last"] > 0:
+                    portfolio_value += holding * t["last"]
         self.logger.info("Portfolio value: $%s", f"{portfolio_value:,.2f}")
 
         for pair in PAIRS:
@@ -278,7 +291,7 @@ class TradingBot:
 
             self.logger.info("\n  -- %s --", pair)
 
-            ticker = self.client.get_ticker_spread(pair)
+            ticker = ticker_cache[pair]
             if ticker["spread_pct"] >= 999:
                 self.logger.warning("  Ticker unavailable for %s, skipping", pair)
                 continue
