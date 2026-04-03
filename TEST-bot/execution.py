@@ -8,7 +8,7 @@ import hashlib
 import json
 import logging
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from config import (
     BASE_URL, API_KEY, SECRET_KEY,
     USE_LIMIT_ORDERS, LIMIT_ORDER_OFFSET_PCT, LIMIT_ORDER_TIMEOUT_SEC,
@@ -35,7 +35,6 @@ class RateLimiter:
     def wait_if_needed(self):
         """Block until we're under the rate limit."""
         now = time.time()
-        # Remove timestamps older than 60 seconds
         self.call_timestamps = [t for t in self.call_timestamps if now - t < 60]
 
         if len(self.call_timestamps) >= self.max_calls:
@@ -72,7 +71,7 @@ class RoostooClient:
         return str(int(time.time() * 1000))
 
     def _sign(self, payload: dict) -> tuple:
-        """Generate HMAC SHA256 signature. Returns (headers, signed_payload_str)."""
+        """Generate HMAC SHA256 signature."""
         payload["timestamp"] = self._timestamp()
         sorted_keys = sorted(payload.keys())
         param_str = "&".join(f"{k}={payload[k]}" for k in sorted_keys)
@@ -100,7 +99,6 @@ class RoostooClient:
             try:
                 if signed:
                     headers, payload, param_str = self._sign(payload or {})
-
                     if method == "GET":
                         resp = requests.get(url, headers=headers, params=payload, timeout=10)
                     else:
@@ -137,7 +135,6 @@ class RoostooClient:
         return self._request_with_retry("GET", "/v3/exchangeInfo")
 
     def get_ticker(self, pair: str = None) -> dict:
-        """Get live ticker. Returns price + spread data."""
         payload = {}
         if pair:
             payload["pair"] = pair
@@ -200,11 +197,9 @@ class RoostooClient:
         wallet = balance.get("SpotWallet", balance.get("Wallet", {}))
         total = 0.0
 
-        # USD balance
         usd = wallet.get("USD", {})
         total += usd.get("Free", 0) + usd.get("Lock", 0)
 
-        # Crypto holdings — price them via ticker
         for coin, amounts in wallet.items():
             if coin == "USD":
                 continue
@@ -240,7 +235,6 @@ class RoostooClient:
 
     def _log_trade(self, pair, side, quantity, price, order_type, result):
         """Append trade to JSONL log file."""
-        import os
         os.makedirs(os.path.dirname(LOG_TRADES_FILE), exist_ok=True)
         entry = {
             "timestamp": datetime.utcnow().isoformat(),
@@ -261,7 +255,7 @@ class RoostooClient:
 
 
 # ═══════════════════════════════════════════════════════════════
-# SMART ORDER EXECUTOR (limit order with fallback)
+# SMART ORDER EXECUTOR
 # ═══════════════════════════════════════════════════════════════
 
 class OrderExecutor:
@@ -269,7 +263,7 @@ class OrderExecutor:
     Executes orders using limit-first strategy:
     1. Place limit order slightly inside the spread
     2. Wait up to LIMIT_ORDER_TIMEOUT_SEC for fill
-    3. If not filled, cancel and optionally fall back to market order
+    3. If not filled, cancel and fall back to market order
     """
 
     def __init__(self, client: RoostooClient):
@@ -278,43 +272,32 @@ class OrderExecutor:
     def execute_buy(self, pair: str, quantity: float, ticker_data: dict) -> dict:
         """Execute a buy order with limit-first strategy."""
         if USE_LIMIT_ORDERS and ticker_data.get("ask"):
-            # Place limit slightly below ask (inside the spread)
             limit_price = round(ticker_data["ask"] * (1 - LIMIT_ORDER_OFFSET_PCT), 2)
-
             logger.info(f"Placing LIMIT BUY {pair}: qty={quantity}, price={limit_price}")
             result = self.client.place_order(pair, "BUY", quantity,
                                              price=limit_price, order_type="LIMIT")
 
             if result.get("Success") and result.get("OrderDetail", {}).get("Status") == "PENDING":
-                # Wait for fill
                 order_id = result["OrderDetail"]["OrderID"]
                 filled = self._wait_for_fill(order_id)
-
                 if filled:
                     return filled
-
-                # Not filled — cancel and fall back
                 logger.info(f"Limit order {order_id} not filled, cancelling...")
                 self.client.cancel_order(order_id=str(order_id))
-
                 if LIMIT_ORDER_FALLBACK_MARKET:
                     logger.info(f"Falling back to MARKET BUY {pair}: qty={quantity}")
                     return self.client.place_order(pair, "BUY", quantity, order_type="MARKET")
                 return result
 
-            # Already filled as taker (crossed the spread) or error
             return result
 
-        # Market order fallback
         logger.info(f"Placing MARKET BUY {pair}: qty={quantity}")
         return self.client.place_order(pair, "BUY", quantity, order_type="MARKET")
 
     def execute_sell(self, pair: str, quantity: float, ticker_data: dict) -> dict:
         """Execute a sell order with limit-first strategy."""
         if USE_LIMIT_ORDERS and ticker_data.get("bid"):
-            # Place limit slightly above bid (inside the spread)
             limit_price = round(ticker_data["bid"] * (1 + LIMIT_ORDER_OFFSET_PCT), 2)
-
             logger.info(f"Placing LIMIT SELL {pair}: qty={quantity}, price={limit_price}")
             result = self.client.place_order(pair, "SELL", quantity,
                                              price=limit_price, order_type="LIMIT")
@@ -322,13 +305,10 @@ class OrderExecutor:
             if result.get("Success") and result.get("OrderDetail", {}).get("Status") == "PENDING":
                 order_id = result["OrderDetail"]["OrderID"]
                 filled = self._wait_for_fill(order_id)
-
                 if filled:
                     return filled
-
                 logger.info(f"Limit order {order_id} not filled, cancelling...")
                 self.client.cancel_order(order_id=str(order_id))
-
                 if LIMIT_ORDER_FALLBACK_MARKET:
                     logger.info(f"Falling back to MARKET SELL {pair}: qty={quantity}")
                     return self.client.place_order(pair, "SELL", quantity, order_type="MARKET")
@@ -343,7 +323,7 @@ class OrderExecutor:
         """Poll order status until filled or timeout."""
         start = time.time()
         while time.time() - start < LIMIT_ORDER_TIMEOUT_SEC:
-            time.sleep(5)  # Check every 5 seconds
+            time.sleep(5)
             result = self.client.query_order(order_id=str(order_id))
             if result.get("Success"):
                 orders = result.get("OrderMatched", [])
@@ -370,7 +350,6 @@ class CooldownManager:
     """
 
     def __init__(self):
-        # {pair: {"exit_time": datetime, "stability_count": int}}
         self.cooldowns = {}
         self._load()
 
@@ -407,29 +386,22 @@ class CooldownManager:
         logger.info(f"Cooldown started for {pair}")
 
     def is_on_cooldown(self, pair: str, regime_probs: dict) -> bool:
-        """
-        Check if pair is still on cooldown.
-        Updates stability counter based on regime confidence.
-        """
+        """Check if pair is still on cooldown."""
         if pair not in self.cooldowns:
             return False
 
         cd = self.cooldowns[pair]
         elapsed = (datetime.utcnow() - cd["exit_time"]).total_seconds() / 60
 
-        # Condition 1: minimum time
         if elapsed < COOLDOWN_MIN_MINUTES:
-            logger.debug(
-                f"{pair} cooldown: {elapsed:.0f}/{COOLDOWN_MIN_MINUTES} min elapsed"
-            )
+            logger.debug(f"{pair} cooldown: {elapsed:.0f}/{COOLDOWN_MIN_MINUTES} min elapsed")
             return True
 
-        # Condition 2: regime stability
         max_prob = max(regime_probs.values())
         if max_prob >= COOLDOWN_STABILITY_THRESHOLD:
             cd["stability_count"] += 1
         else:
-            cd["stability_count"] = 0  # Reset if unstable
+            cd["stability_count"] = 0
 
         if cd["stability_count"] < COOLDOWN_STABILITY_CHECKS:
             logger.debug(
@@ -437,7 +409,6 @@ class CooldownManager:
             )
             return True
 
-        # Both conditions met — exit cooldown
         logger.info(f"{pair} cooldown complete after {elapsed:.0f} minutes")
         del self.cooldowns[pair]
         self._save()

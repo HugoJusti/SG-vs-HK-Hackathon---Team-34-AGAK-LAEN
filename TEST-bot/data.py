@@ -20,12 +20,12 @@ logger = logging.getLogger(__name__)
 # BINANCE HISTORICAL DATA (for HMM training)
 # ═══════════════════════════════════════════════════════════════
 
-def fetch_binance_klines(symbol: str, interval: str = "1h",
+def fetch_binance_klines(symbol: str, interval: str = "5m",
                          limit_hours: int = HMM_TRAINING_HOURS) -> pd.DataFrame:
     """
     Fetch historical klines from Binance public API.
     symbol: e.g. "BTCUSDT", "ETHUSDT"
-    interval: "1h", "4h", "1d", etc.
+    interval: "5m", "1h", "4h", "1d", etc.
     Returns DataFrame with OHLCV + timestamp.
     """
     url = "https://api.binance.com/api/v3/klines"
@@ -118,26 +118,25 @@ def load_or_fetch_historical(pair: str, force_refresh: bool = False) -> pd.DataF
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute the 4 HMM observation features + MA indicators.
-    
+    Compute the 4 HMM observation features + EMA indicators.
+
     Features:
       1. log_return:    ln(close_t / close_{t-1})
       2. rolling_vol:   20-period rolling std of log returns (annualised)
       3. momentum:      10-period rate of change
       4. volume_zscore: (volume - rolling_mean) / rolling_std
-    
+
     Indicators (not HMM features, used as trade filters):
-      - ma20: 20-period simple moving average
-      - ma50: 50-period simple moving average
+      - ma20: 20-period EMA
+      - ma50: 50-period EMA
     """
     df = df.copy()
 
     # 1. Log returns
     df["log_return"] = np.log(df["close"] / df["close"].shift(1))
 
-    # 2. Rolling volatility (20-period, annualised for hourly data)
-    #    Annualisation factor: sqrt(24 * 365) ≈ sqrt(8760)
-    # df["rolling_vol"] = df["log_return"].rolling(window=20).std() * np.sqrt(8760)
+    # 2. Rolling volatility (20-period, annualised for 5m data)
+    #    Annualisation factor: sqrt(12 * 24 * 365) = sqrt(105120)
     df["rolling_vol"] = df["log_return"].rolling(window=20).std() * np.sqrt(105120)
 
     # 3. Momentum (10-period Rate of Change)
@@ -148,7 +147,7 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     vol_std = df["volume"].rolling(window=20).std()
     df["volume_zscore"] = (df["volume"] - vol_mean) / vol_std
 
-    # Moving averages (trade filters, not HMM features)
+    # EMAs (exponential moving averages — trade filters, not HMM features)
     df["ma20"] = df["close"].ewm(span=ENTRY_MA_SHORT, adjust=False).mean()
     df["ma50"] = df["close"].ewm(span=EXIT_MA_LONG, adjust=False).mean()
 
@@ -183,10 +182,10 @@ def compute_live_features(historical_df: pd.DataFrame, live_price: float,
     # Log return
     log_return = np.log(closes[-1] / closes[-2])
 
-    # Rolling vol (last 20 log returns, annualised)
+    # Rolling vol (last 20 log returns, annualised for 5m)
     log_returns = np.diff(np.log(closes[-21:]))
-    # rolling_vol = np.std(log_returns) * np.sqrt(8760)
     rolling_vol = np.std(log_returns) * np.sqrt(105120)
+
     # Momentum (10-period ROC)
     momentum = (closes[-1] - closes[-11]) / closes[-11]
 
@@ -194,7 +193,7 @@ def compute_live_features(historical_df: pd.DataFrame, live_price: float,
     vol_window = volumes[-20:]
     volume_zscore = (volumes[-1] - np.mean(vol_window)) / (np.std(vol_window) + 1e-10)
 
-    # EMAs (exponential moving averages)
+    # EMAs
     alpha20 = 2 / (ENTRY_MA_SHORT + 1)
     weights20 = np.array([(1 - alpha20) ** i for i in range(20)])[::-1]
     ma20 = np.sum(weights20 * closes[-20:]) / np.sum(weights20)
@@ -212,12 +211,3 @@ def compute_live_features(historical_df: pd.DataFrame, live_price: float,
         "ma50": ma50,
         "close": live_price,
     }
-from sklearn.preprocessing import StandardScaler
-
-def get_scaled_hmm_observations(df):
-    """Scale features to zero mean, unit variance for better HMM training."""
-    feature_cols = ["log_return", "rolling_vol", "momentum", "volume_zscore"]
-    raw = df[feature_cols].values
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(raw)
-    return scaled, scaler

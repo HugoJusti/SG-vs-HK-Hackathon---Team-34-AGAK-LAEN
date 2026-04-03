@@ -9,7 +9,7 @@ from hmmlearn.hmm import GaussianHMM
 from config import (
     HMM_N_STATES, HMM_MODEL_DIR,
     ENTRY_HMM_CONFIDENCE, ENTRY_MAX_VOLATILITY, ENTRY_MOMENTUM_MIN,
-    ENTRY_VOLUME_ZSCORE_MAX, ENTRY_MA_SHORT, ENTRY_SPREAD_MAX_PCT,
+    ENTRY_VOLUME_ZSCORE_MAX, ENTRY_SPREAD_MAX_PCT,
     EXIT_STOP_LOSS_PCT, EXIT_TAKE_PROFIT_PCT,
     MC_NUM_SIMULATIONS, MC_HORIZON_HOURS, MC_MAX_POSITION_PCT,
     MC_MIN_POSITION_PCT, MC_TAIL_RISK_LIMIT
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class RegimeHMM:
     """
     3-state Gaussian HMM for market regime detection.
-    
+
     States are labelled post-training based on mean returns:
       - Highest mean return → "bullish" (state index stored in self.bull_idx)
       - Lowest mean return  → "bearish" (state index stored in self.bear_idx)
@@ -40,9 +40,7 @@ class RegimeHMM:
         self.is_trained = False
 
     def train(self, observations: np.ndarray, pair: str = ""):
-        """
-        Train HMM on observation matrix (N x 4 features).
-        """
+        """Train HMM on observation matrix (N x 4 features)."""
         logger.info(f"Training HMM for {pair} on {len(observations)} observations...")
 
         self.model = GaussianHMM(
@@ -56,7 +54,7 @@ class RegimeHMM:
         self.model.fit(observations)
 
         # Label states by mean log return (feature index 0)
-        means = self.model.means_[:, 0]  # log_return means per state
+        means = self.model.means_[:, 0]
         sorted_indices = np.argsort(means)
         self.bear_idx = sorted_indices[0]
         self.neut_idx = sorted_indices[1]
@@ -73,15 +71,15 @@ class RegimeHMM:
     def get_regime_probabilities(self, observations: np.ndarray) -> dict:
         """
         Given recent observations, return current regime probabilities.
+        Uses last 288 candles (24h of 5m data) for context.
         Returns: {"bullish": float, "bearish": float, "neutral": float}
         """
         if not self.is_trained:
             return {"bullish": 0.33, "bearish": 0.33, "neutral": 0.34}
 
-        # Use last 100 observations for context
         recent = observations[-288:] if len(observations) > 288 else observations
         posteriors = self.model.predict_proba(recent)
-        current = posteriors[-1]  # last time step
+        current = posteriors[-1]
 
         return {
             "bullish": float(current[self.bull_idx]),
@@ -90,17 +88,14 @@ class RegimeHMM:
         }
 
     def get_regime_params(self) -> dict:
-        """
-        Extract per-regime parameters for Monte Carlo simulation.
-        Returns mean and covariance for each regime, plus transition matrix.
-        """
+        """Extract per-regime parameters for Monte Carlo simulation."""
         if not self.is_trained:
             return None
 
         return {
-            "means": self.model.means_,         # (3, 4) per-state feature means
-            "covars": self.model.covars_,        # (3, 4, 4) per-state covariances
-            "transmat": self.model.transmat_,    # (3, 3) transition probabilities
+            "means": self.model.means_,
+            "covars": self.model.covars_,
+            "transmat": self.model.transmat_,
             "bull_idx": self.bull_idx,
             "bear_idx": self.bear_idx,
             "neut_idx": self.neut_idx,
@@ -136,19 +131,8 @@ def monte_carlo_position_size(regime_params: dict, current_regime_idx: int,
                               portfolio_value: float) -> dict:
     """
     Run Monte Carlo simulation to determine position size.
-    
-    Simulates MC_NUM_SIMULATIONS forward paths of MC_HORIZON_HOURS length,
-    starting from current_regime_idx, using regime-specific return distributions
-    and transition probabilities.
-    
-    Returns:
-        {
-            "position_pct": float,     # recommended % of portfolio
-            "position_usd": float,     # dollar amount
-            "paths_positive_pct": float,
-            "median_return": float,
-            "tail_risk_5pct": float,   # 5th percentile return
-        }
+    MC no longer gates trades — only sizes them.
+    Returns minimum position (5%) if tail risk is too high, else maximum (30%).
     """
     if regime_params is None:
         return {
@@ -159,8 +143,8 @@ def monte_carlo_position_size(regime_params: dict, current_regime_idx: int,
             "tail_risk_5pct": 0.0,
         }
 
-    means = regime_params["means"][:, 0]       # log return means per regime
-    stds = np.sqrt(regime_params["covars"][:, 0, 0])  # log return stds per regime
+    means = regime_params["means"][:, 0]
+    stds = np.sqrt(regime_params["covars"][:, 0, 0])
     transmat = regime_params["transmat"]
 
     n_sims = MC_NUM_SIMULATIONS
@@ -172,26 +156,20 @@ def monte_carlo_position_size(regime_params: dict, current_regime_idx: int,
         state = current_regime_idx
 
         for _ in range(horizon):
-            # Draw return from current regime's distribution
             ret = np.random.normal(means[state], stds[state])
             cumulative_return += ret
-
-            # Transition to next state
             state = np.random.choice(HMM_N_STATES, p=transmat[state])
 
         final_returns[sim] = cumulative_return
 
-    # Analyse simulation results
     paths_positive = np.mean(final_returns > 0)
     median_return = np.median(final_returns)
     tail_risk = np.percentile(final_returns, 5)
 
-    # Determine position size — MC no longer gates trades, only sizes them
+    # MC only sizes — does not gate trades
     if tail_risk < -MC_TAIL_RISK_LIMIT:
-        # Tail risk too high, use minimum
         position_pct = MC_MIN_POSITION_PCT
     else:
-        # Use maximum position — entry confluences already confirmed the trade
         position_pct = MC_MAX_POSITION_PCT
 
     result = {
@@ -218,21 +196,20 @@ def monte_carlo_position_size(regime_params: dict, current_regime_idx: int,
 
 class SignalGenerator:
     """
-    Combines HMM regime probabilities, feature filters, MA confirmation,
+    Combines HMM regime probabilities, feature filters, EMA confirmation,
     and spread filter to produce BUY/SELL/HOLD signals.
     """
 
     def generate_signal(self, regime_probs: dict, features: dict,
                         spread_pct: float, current_position: dict) -> dict:
         """
-        Args:
-            regime_probs: {"bullish": float, "bearish": float, "neutral": float}
-            features: dict with log_return, rolling_vol, momentum, volume_zscore, ma20, ma50, close
-            spread_pct: current bid-ask spread as percentage
-            current_position: {"side": "long"/"none", "entry_price": float, "pair": str}
-        
-        Returns:
-            {"action": "BUY"/"SELL"/"HOLD", "reasons": [str], "confidence": float}
+        Entry logic:
+          - Mandatory: momentum > 0 AND price > EMA20
+          - Plus at least 2 of 4: HMM bullish, vol filter, z-score, spread
+
+        Exit logic:
+          - Stop loss: drawdown >= 3%
+          - Take profit: gain >= 3%
         """
         action = "HOLD"
         reasons = []
@@ -240,12 +217,11 @@ class SignalGenerator:
         close = features["close"]
         has_position = current_position.get("side") == "long"
 
-        # ── EXIT LOGIC (check first — protecting capital is priority) ──
+        # ── EXIT LOGIC ──
         if has_position:
             entry_price = current_position.get("entry_price", close)
             drawdown = (entry_price - close) / entry_price
 
-            # Hard stop loss
             if drawdown >= EXIT_STOP_LOSS_PCT:
                 return {
                     "action": "SELL",
@@ -253,7 +229,6 @@ class SignalGenerator:
                     "confidence": 1.0
                 }
 
-            # Take profit
             gain = (close - entry_price) / entry_price
             if gain >= EXIT_TAKE_PROFIT_PCT:
                 return {
@@ -262,9 +237,7 @@ class SignalGenerator:
                     "confidence": 1.0
                 }
 
-            # MA20 and HMM bearish exits disabled — relying on stop loss and take profit only
-
-        # ── ENTRY LOGIC (all conditions must pass) ──
+        # ── ENTRY LOGIC ──
         if not has_position:
             entry_checks = []
 
@@ -278,7 +251,7 @@ class SignalGenerator:
             entry_checks.append(("Vol filter", vol_ok,
                                  f"vol={features['rolling_vol']:.4f} vs {ENTRY_MAX_VOLATILITY}"))
 
-            # 3. Momentum filter
+            # 3. Momentum filter (mandatory)
             mom_ok = features["momentum"] > ENTRY_MOMENTUM_MIN
             entry_checks.append(("Momentum", mom_ok,
                                  f"mom={features['momentum']:.6f} vs {ENTRY_MOMENTUM_MIN}"))
@@ -288,27 +261,24 @@ class SignalGenerator:
             entry_checks.append(("Vol z-score", vz_ok,
                                  f"|z|={abs(features['volume_zscore']):.3f} vs {ENTRY_VOLUME_ZSCORE_MAX}"))
 
-            # 5. MA20 confirmation
+            # 5. EMA20 confirmation (mandatory)
             ma_ok = close > features["ma20"]
-            entry_checks.append(("MA20 confirm", ma_ok,
-                                 f"close={close:.2f} vs MA20={features['ma20']:.2f}"))
+            entry_checks.append(("EMA20 confirm", ma_ok,
+                                 f"close={close:.2f} vs EMA20={features['ma20']:.2f}"))
 
-            # 6. Spread filter (Option B — not in HMM, just a gate)
+            # 6. Spread filter
             spread_ok = spread_pct < ENTRY_SPREAD_MAX_PCT
             entry_checks.append(("Spread filter", spread_ok,
                                  f"spread={spread_pct:.4f}% vs {ENTRY_SPREAD_MAX_PCT}%"))
-            # Momentum and MA20 are mandatory
+
+            # Momentum and EMA20 are mandatory; at least 2 of remaining 4 must pass
             if not mom_ok or not ma_ok:
                 all_pass = 0
             else:
-                # At least 2 of the remaining 4 must pass
                 remaining = [hmm_ok, vol_ok, vz_ok, spread_ok]
                 all_pass = 1 if sum(remaining) >= 2 else 0
 
-            if all_pass:
-                action = "BUY"
-            else:
-                action = "HOLD"
+            action = "BUY" if all_pass else "HOLD"
             reasons = [f"{'[PASS]' if c[1] else '[FAIL]'} {c[0]}: {c[2]}" for c in entry_checks]
 
             return {
@@ -317,7 +287,7 @@ class SignalGenerator:
                 "confidence": regime_probs.get("bullish", 0) if all_pass else 0.0
             }
 
-        # Holding position, no exit triggered
+        # Holding — no exit triggered
         return {
             "action": "HOLD",
             "reasons": ["Position held — no exit conditions met"],
