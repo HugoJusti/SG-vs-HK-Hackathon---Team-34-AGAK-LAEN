@@ -1,13 +1,14 @@
 """
 Execution module: Roostoo API interaction, order management, cooldown, rate limiting.
 """
+import os
 import time
 import hmac
 import hashlib
 import json
 import logging
 import requests
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from config import (
     BASE_URL, API_KEY, SECRET_KEY,
     USE_LIMIT_ORDERS, LIMIT_ORDER_OFFSET_PCT, LIMIT_ORDER_TIMEOUT_SEC,
@@ -18,15 +19,6 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _json_default(value):
-    """Normalize datetime and scalar wrapper values for JSON logging."""
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if hasattr(value, "item") and callable(value.item):
-        return value.item()
-    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -251,7 +243,7 @@ class RoostooClient:
         import os
         os.makedirs(os.path.dirname(LOG_TRADES_FILE), exist_ok=True)
         entry = {
-            "timestamp": datetime.now(UTC).isoformat(),
+            "timestamp": datetime.utcnow().isoformat(),
             "pair": pair,
             "side": side,
             "quantity": quantity,
@@ -265,7 +257,7 @@ class RoostooClient:
             "api_response": result,
         }
         with open(LOG_TRADES_FILE, "a") as f:
-            f.write(json.dumps(entry, default=_json_default) + "\n")
+            f.write(json.dumps(entry) + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -365,10 +357,13 @@ class OrderExecutor:
 # COOLDOWN MANAGER
 # ═══════════════════════════════════════════════════════════════
 
+COOLDOWN_STATE_FILE = "logs/cooldown_state.json"
+
+
 class CooldownManager:
     """
-    Manages post-exit cooldown per trading pair.
-    
+    Manages post-exit cooldown per trading pair, persisted across restarts.
+
     Two conditions must be met to exit cooldown:
     1. Minimum time has elapsed (COOLDOWN_MIN_MINUTES)
     2. HMM regime has stabilised (consistent confidence for N checks)
@@ -377,13 +372,38 @@ class CooldownManager:
     def __init__(self):
         # {pair: {"exit_time": datetime, "stability_count": int}}
         self.cooldowns = {}
+        self._load()
+
+    def _load(self):
+        if os.path.exists(COOLDOWN_STATE_FILE):
+            with open(COOLDOWN_STATE_FILE) as f:
+                raw = json.load(f)
+            for pair, cd in raw.items():
+                self.cooldowns[pair] = {
+                    "exit_time": datetime.fromisoformat(cd["exit_time"]),
+                    "stability_count": cd["stability_count"],
+                }
+            logger.info(f"Restored cooldowns for: {list(self.cooldowns.keys())}")
+
+    def _save(self):
+        os.makedirs(os.path.dirname(COOLDOWN_STATE_FILE), exist_ok=True)
+        raw = {
+            pair: {
+                "exit_time": cd["exit_time"].isoformat(),
+                "stability_count": cd["stability_count"],
+            }
+            for pair, cd in self.cooldowns.items()
+        }
+        with open(COOLDOWN_STATE_FILE, "w") as f:
+            json.dump(raw, f, indent=2)
 
     def start_cooldown(self, pair: str):
         """Call this after exiting a position."""
         self.cooldowns[pair] = {
-            "exit_time": datetime.now(UTC),
+            "exit_time": datetime.utcnow(),
             "stability_count": 0,
         }
+        self._save()
         logger.info(f"Cooldown started for {pair}")
 
     def is_on_cooldown(self, pair: str, regime_probs: dict) -> bool:
@@ -395,7 +415,7 @@ class CooldownManager:
             return False
 
         cd = self.cooldowns[pair]
-        elapsed = (datetime.now(UTC) - cd["exit_time"]).total_seconds() / 60
+        elapsed = (datetime.utcnow() - cd["exit_time"]).total_seconds() / 60
 
         # Condition 1: minimum time
         if elapsed < COOLDOWN_MIN_MINUTES:
@@ -420,4 +440,5 @@ class CooldownManager:
         # Both conditions met — exit cooldown
         logger.info(f"{pair} cooldown complete after {elapsed:.0f} minutes")
         del self.cooldowns[pair]
+        self._save()
         return False

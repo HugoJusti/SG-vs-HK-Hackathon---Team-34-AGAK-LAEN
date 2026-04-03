@@ -1,0 +1,281 @@
+{
+  "dataset": {
+    "asset_name": "BTCUSD",
+    "csv_path": "C:\\Users\\keena\\Downloads\\HKU\\Hackathon\\SG-vs-HK-Hackathon---Team-34-AGAK-LAEN\\TEST-bot\\data\\BTCUSDT_1h.csv",
+    "rows_after_feature_engineering": 8558,
+    "recent_days_used": 30,
+    "start_time": "2026-02-19T14:00:00",
+    "end_time": "2026-03-21T07:05:00",
+    "train_rows": 6846,
+    "test_rows": 1712,
+    "bar_interval_minutes": 5.0,
+    "target_horizon_bars": 12,
+    "lookback_window_bars": 24,
+    "overall_target_distribution": {
+      "bearish": 796,
+      "neutral": 6926,
+      "bullish": 836
+    },
+    "train_target_distribution": {
+      "bearish": 655,
+      "neutral": 5473,
+      "bullish": 718
+    },
+    "validation_target_distribution": {
+      "bearish": 103,
+      "neutral": 1146,
+      "bullish": 121
+    },
+    "test_target_distribution": {
+      "bearish": 141,
+      "neutral": 1453,
+      "bullish": 118
+    }
+  },
+  "model": {
+    "type": "MLPClassifier",
+    "feature_count": 432,
+    "base_sequence_features": [
+      "log_return",
+      "return_3",
+      "return_6",
+      "return_12",
+      "rolling_vol_6",
+      "rolling_vol_20",
+      "rolling_vol_48",
+      "momentum_10",
+      "rsi_14",
+      "atr_pct_14",
+      "macd_hist",
+      "bollinger_z_20",
+      "volume_zscore_20",
+      "close_to_ma20",
+      "close_to_ma50",
+      "ma_gap_20_50",
+      "intrabar_range_pct",
+      "candle_body_pct"
+    ],
+    "hidden_layers": [
+      64,
+      32
+    ],
+    "epochs_requested": 20,
+    "best_epoch": 19,
+    "epochs_trained": 20,
+    "early_stop_epoch": null,
+    "patience": 5,
+    "selection_metric": "lowest validation log loss, then balanced accuracy, then accuracy",
+    "selection_train_accuracy": 0.6519357195032871,
+    "selection_train_balanced_accuracy": 0.7232951813502702,
+    "selection_train_loss": 0.7811171216672426,
+    "selection_validation_loss": 0.9247863533801728,
+    "best_validation_loss": 0.9247863533801728,
+    "best_validation_accuracy": 0.57007299270073,
+    "best_validation_balanced_accuracy": 0.37616433648836156,
+    "full_train_accuracy": 0.6248904469763366,
+    "full_train_balanced_accuracy": 0.715308691605578,
+    "full_train_actionable_accuracy": 0.7793153678077204,
+    "test_accuracy": 0.4649532710280374,
+    "test_balanced_accuracy": 0.3199530170558192,
+    "test_actionable_accuracy": 0.22007722007722008,
+    "training_class_distribution": {
+      "bearish": 552,
+      "neutral": 4327,
+      "bullish": 597
+    },
+    "train_full_class_distribution": {
+      "bearish": 655,
+      "neutral": 5473,
+      "bullish": 718
+    }
+  },
+  "objective_weights": {
+    "sortino_ratio": 0.4,
+    "sharpe_ratio": 0.3,
+    "calmar_ratio": 0.3
+  },
+  "target_definition": {
+    "classes": {
+      "-1": "bearish",
+      "0": "neutral",
+      "1": "bullish"
+    },
+    "minimum_move_threshold": 0.006,
+    "neutral_volatility_multiplier": 0.8,
+    "rule": "bullish if future_return > max(min_move_threshold, bar_volatility * sqrt(horizon_bars) * neutral_volatility_multiplier); bearish if future_return < -that threshold; otherwise neutral"
+  },
+  "assumptions": {
+    "training_balance": "The MLP is trained on the original chronological samples using class-balanced sample weights instead of per-epoch random oversampling.",
+    "confidence_source": "ENTRY_HMM_CONFIDENCE is optimized against MLP bullish class probabilities from a 3-class bull/neutral/bear model. Exit decisions follow stop-loss and take-profit only, matching strategy.py.",
+    "spread_proxy": "The CSV has no bid/ask spread, so estimated_spread_pct uses 5% of the 3-candle median intrabar range in percentage points.",
+    "inactive_strategy_parameters": {
+      "EXIT_HMM_CONFIDENCE": "Not optimized because the current strategy exit logic does not use bearish-probability exits.",
+      "EXIT_MA_LONG": "Not optimized because the current strategy exit logic does not use a long moving-average exit."
+    },
+    "positioning": "Long-only, one position at a time, using close-to-close returns.",
+    "cost_model": "Half of the synthetic spread is charged on entry and exit."
+  },
+  "default_parameters": {
+    "ENTRY_HMM_CONFIDENCE": 0.65,
+    "ENTRY_MAX_VOLATILITY": 0.5,
+    "ENTRY_MOMENTUM_MIN": 0.0,
+    "ENTRY_VOLUME_ZSCORE_MAX": 4.5,
+    "ENTRY_MA_SHORT": 20,
+    "ENTRY_SPREAD_MAX_PCT": 0.05,
+    "EXIT_STOP_LOSS_PCT": 0.03,
+    "EXIT_TAKE_PROFIT_PCT": 0.03
+  },
+  "optimized_parameters": {
+    "ENTRY_HMM_CONFIDENCE": 0.65,
+    "ENTRY_MAX_VOLATILITY": 0.5,
+    "ENTRY_MOMENTUM_MIN": 0.0,
+    "ENTRY_VOLUME_ZSCORE_MAX": 4.5,
+    "ENTRY_MA_SHORT": 20,
+    "ENTRY_SPREAD_MAX_PCT": 0.05,
+    "EXIT_STOP_LOSS_PCT": 0.03,
+    "EXIT_TAKE_PROFIT_PCT": 0.03
+  },
+  "optimized_train_metrics": {
+    "objective_raw": 4.412326844651525,
+    "sortino_ratio": 2.3322682429413324,
+    "sharpe_ratio": 1.620360909185481,
+    "calmar_ratio": 9.977704249064493,
+    "annualized_return": 1.0978476443480076,
+    "max_drawdown": -0.11003008477134824,
+    "total_return": 0.04943540454258133,
+    "objective": 4.412326844651525,
+    "trade_penalty": 0.0,
+    "closed_trades": 23,
+    "win_rate": 0.5217391304347826,
+    "avg_trade_return": 0.0025911303885662903,
+    "avg_holding_hours": 24.257246376811597,
+    "exposure_ratio": 0.9780861943024105
+  },
+  "optimized_test_metrics": {
+    "objective_raw": -4.361761975201962,
+    "sortino_ratio": -3.500607298972828,
+    "sharpe_ratio": -2.4713085540576576,
+    "calmar_ratio": -7.400421631318446,
+    "annualized_return": -0.7219950445357985,
+    "max_drawdown": -0.09756133913780385,
+    "total_return": -0.02063234507718137,
+    "objective": -4.661761975201962,
+    "trade_penalty": 0.3,
+    "closed_trades": 4,
+    "win_rate": 0.5,
+    "avg_trade_return": -0.004813578128105357,
+    "avg_holding_hours": 34.875,
+    "exposure_ratio": 0.978375219170076
+  },
+  "default_train_metrics": {
+    "objective_raw": 4.412326844651525,
+    "sortino_ratio": 2.3322682429413324,
+    "sharpe_ratio": 1.620360909185481,
+    "calmar_ratio": 9.977704249064493,
+    "annualized_return": 1.0978476443480076,
+    "max_drawdown": -0.11003008477134824,
+    "total_return": 0.04943540454258133,
+    "objective": 4.412326844651525,
+    "trade_penalty": 0.0,
+    "closed_trades": 23,
+    "win_rate": 0.5217391304347826,
+    "avg_trade_return": 0.0025911303885662903,
+    "avg_holding_hours": 24.257246376811597,
+    "exposure_ratio": 0.9780861943024105
+  },
+  "default_test_metrics": {
+    "objective_raw": -4.361761975201962,
+    "sortino_ratio": -3.500607298972828,
+    "sharpe_ratio": -2.4713085540576576,
+    "calmar_ratio": -7.400421631318446,
+    "annualized_return": -0.7219950445357985,
+    "max_drawdown": -0.09756133913780385,
+    "total_return": -0.02063234507718137,
+    "objective": -4.661761975201962,
+    "trade_penalty": 0.3,
+    "closed_trades": 4,
+    "win_rate": 0.5,
+    "avg_trade_return": -0.004813578128105357,
+    "avg_holding_hours": 34.875,
+    "exposure_ratio": 0.978375219170076
+  },
+  "simulation": {
+    "optimized_train": {
+      "starting_capital": 10000.0,
+      "ending_capital": 10494.354045425813,
+      "net_profit": 494.3540454258127,
+      "profit_pct": 4.943540454258133,
+      "annualized_return_pct": 109.78476443480076,
+      "max_drawdown_pct": -11.003008477134824,
+      "objective": 4.412326844651525,
+      "objective_raw": 4.412326844651525,
+      "sortino_ratio": 2.3322682429413324,
+      "sharpe_ratio": 1.620360909185481,
+      "calmar_ratio": 9.977704249064493,
+      "closed_trades": 23,
+      "win_rate_pct": 52.17391304347826,
+      "avg_trade_return_pct": 0.259113038856629,
+      "avg_holding_hours": 24.257246376811597,
+      "exposure_ratio_pct": 97.80861943024105,
+      "trade_penalty": 0.0
+    },
+    "optimized_test": {
+      "starting_capital": 10000.0,
+      "ending_capital": 9793.676549228187,
+      "net_profit": -206.32345077181344,
+      "profit_pct": -2.063234507718137,
+      "annualized_return_pct": -72.19950445357985,
+      "max_drawdown_pct": -9.756133913780385,
+      "objective": -4.661761975201962,
+      "objective_raw": -4.361761975201962,
+      "sortino_ratio": -3.500607298972828,
+      "sharpe_ratio": -2.4713085540576576,
+      "calmar_ratio": -7.400421631318446,
+      "closed_trades": 4,
+      "win_rate_pct": 50.0,
+      "avg_trade_return_pct": -0.4813578128105357,
+      "avg_holding_hours": 34.875,
+      "exposure_ratio_pct": 97.83752191700759,
+      "trade_penalty": 0.3
+    },
+    "default_train": {
+      "starting_capital": 10000.0,
+      "ending_capital": 10494.354045425813,
+      "net_profit": 494.3540454258127,
+      "profit_pct": 4.943540454258133,
+      "annualized_return_pct": 109.78476443480076,
+      "max_drawdown_pct": -11.003008477134824,
+      "objective": 4.412326844651525,
+      "objective_raw": 4.412326844651525,
+      "sortino_ratio": 2.3322682429413324,
+      "sharpe_ratio": 1.620360909185481,
+      "calmar_ratio": 9.977704249064493,
+      "closed_trades": 23,
+      "win_rate_pct": 52.17391304347826,
+      "avg_trade_return_pct": 0.259113038856629,
+      "avg_holding_hours": 24.257246376811597,
+      "exposure_ratio_pct": 97.80861943024105,
+      "trade_penalty": 0.0
+    },
+    "default_test": {
+      "starting_capital": 10000.0,
+      "ending_capital": 9793.676549228187,
+      "net_profit": -206.32345077181344,
+      "profit_pct": -2.063234507718137,
+      "annualized_return_pct": -72.19950445357985,
+      "max_drawdown_pct": -9.756133913780385,
+      "objective": -4.661761975201962,
+      "objective_raw": -4.361761975201962,
+      "sortino_ratio": -3.500607298972828,
+      "sharpe_ratio": -2.4713085540576576,
+      "calmar_ratio": -7.400421631318446,
+      "closed_trades": 4,
+      "win_rate_pct": 50.0,
+      "avg_trade_return_pct": -0.4813578128105357,
+      "avg_holding_hours": 34.875,
+      "exposure_ratio_pct": 97.83752191700759,
+      "trade_penalty": 0.3
+    }
+  },
+  "search_candidates_evaluated": 1
+}

@@ -1,0 +1,103 @@
+{
+  "training_window": {
+    "recent_days_used": 30,
+    "policy": "Each asset is trained on the most recent N days ending at the latest timestamp available in that CSV."
+  },
+  "strategy_alignment": {
+    "optimized_parameters": [
+      "ENTRY_HMM_CONFIDENCE",
+      "ENTRY_MAX_VOLATILITY",
+      "ENTRY_MOMENTUM_MIN",
+      "ENTRY_VOLUME_ZSCORE_MAX",
+      "ENTRY_MA_SHORT",
+      "ENTRY_SPREAD_MAX_PCT",
+      "EXIT_STOP_LOSS_PCT",
+      "EXIT_TAKE_PROFIT_PCT"
+    ],
+    "inactive_parameters": [
+      "EXIT_HMM_CONFIDENCE",
+      "EXIT_MA_LONG"
+    ],
+    "exit_logic": "Stop-loss and take-profit only, matching strategy.py."
+  },
+  "assets": {
+    "BTCUSD": {
+      "asset_name": "BTCUSD",
+      "csv_path": "C:\\Users\\keena\\Downloads\\HKU\\Hackathon\\SG-vs-HK-Hackathon---Team-34-AGAK-LAEN\\TEST-bot\\data\\BTCUSDT_1h.csv",
+      "bar_interval_minutes": 5.0,
+      "recent_days_used": 30,
+      "optimized_parameters": {
+        "ENTRY_HMM_CONFIDENCE": 0.65,
+        "ENTRY_MAX_VOLATILITY": 0.5,
+        "ENTRY_MOMENTUM_MIN": 0.0,
+        "ENTRY_VOLUME_ZSCORE_MAX": 4.5,
+        "ENTRY_MA_SHORT": 20,
+        "ENTRY_SPREAD_MAX_PCT": 0.05,
+        "EXIT_STOP_LOSS_PCT": 0.03,
+        "EXIT_TAKE_PROFIT_PCT": 0.03
+      },
+      "default_parameters": {
+        "ENTRY_HMM_CONFIDENCE": 0.65,
+        "ENTRY_MAX_VOLATILITY": 0.5,
+        "ENTRY_MOMENTUM_MIN": 0.0,
+        "ENTRY_VOLUME_ZSCORE_MAX": 4.5,
+        "ENTRY_MA_SHORT": 20,
+        "ENTRY_SPREAD_MAX_PCT": 0.05,
+        "EXIT_STOP_LOSS_PCT": 0.03,
+        "EXIT_TAKE_PROFIT_PCT": 0.03
+      },
+      "model_accuracy": {
+        "train_accuracy": 0.569967864446392,
+        "test_accuracy": 0.4672897196261682,
+        "test_balanced_accuracy": 0.2918599343934196,
+        "test_actionable_accuracy": 0.1776061776061776,
+        "best_epoch": 1
+      },
+      "simulation": {
+        "optimized_test": {
+          "starting_capital": 10000.0,
+          "ending_capital": 9793.676549228187,
+          "net_profit": -206.32345077181344,
+          "profit_pct": -2.063234507718137,
+          "annualized_return_pct": -72.19950445357985,
+          "max_drawdown_pct": -9.756133913780385,
+          "objective": -4.661761975201962,
+          "objective_raw": -4.361761975201962,
+          "sortino_ratio": -3.500607298972828,
+          "sharpe_ratio": -2.4713085540576576,
+          "calmar_ratio": -7.400421631318446,
+          "closed_trades": 4,
+          "win_rate_pct": 50.0,
+          "avg_trade_return_pct": -0.4813578128105357,
+          "avg_holding_hours": 34.875,
+          "exposure_ratio_pct": 97.83752191700759,
+          "trade_penalty": 0.3
+        },
+        "default_test": {
+          "starting_capital": 10000.0,
+          "ending_capital": 9793.676549228187,
+          "net_profit": -206.32345077181344,
+          "profit_pct": -2.063234507718137,
+          "annualized_return_pct": -72.19950445357985,
+          "max_drawdown_pct": -9.756133913780385,
+          "objective": -4.661761975201962,
+          "objective_raw": -4.361761975201962,
+          "sortino_ratio": -3.500607298972828,
+          "sharpe_ratio": -2.4713085540576576,
+          "calmar_ratio": -7.400421631318446,
+          "closed_trades": 4,
+          "win_rate_pct": 50.0,
+          "avg_trade_return_pct": -0.4813578128105357,
+          "avg_holding_hours": 34.875,
+          "exposure_ratio_pct": 97.83752191700759,
+          "trade_penalty": 0.3
+        }
+      },
+      "artifacts": {
+        "params_output": "C:\\Users\\keena\\Downloads\\HKU\\Hackathon\\SG-vs-HK-Hackathon---Team-34-AGAK-LAEN\\TEST-bot\\_ml_smoke_recent\\optimized_strategy_params_btcusd.json",
+        "plot_output": "C:\\Users\\keena\\Downloads\\HKU\\Hackathon\\SG-vs-HK-Hackathon---Team-34-AGAK-LAEN\\TEST-bot\\_ml_smoke_recent\\ml_accuracy_btcusd.png",
+        "model_output": "C:\\Users\\keena\\Downloads\\HKU\\Hackathon\\SG-vs-HK-Hackathon---Team-34-AGAK-LAEN\\TEST-bot\\_ml_smoke_recent\\strategy_mlp_model_btcusd.pkl"
+      }
+    }
+  }
+}

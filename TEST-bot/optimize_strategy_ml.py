@@ -40,13 +40,25 @@ import matplotlib.pyplot as plt
 BASE_DIR = Path(__file__).resolve().parent
 ANNUALIZATION_FACTOR = 24 * 365
 EPSILON = 1e-12
-RANDOM_SEED = 42
-DEFAULT_EPOCHS = 120
-DEFAULT_PATIENCE = 20
+RANDOM_SEED = 41
+DEFAULT_EPOCHS = 67
+DEFAULT_PATIENCE = 8
 DEFAULT_LOOKBACK_WINDOW = 24
 DEFAULT_MIN_MOVE_THRESHOLD = 0.006
 DEFAULT_NEUTRAL_VOL_MULTIPLIER = 0.80
 DEFAULT_STARTING_CAPITAL = 10_000.0
+DEFAULT_RECENT_DAYS = 90
+DEFAULT_HIDDEN_LAYERS = "64,32"
+DEFAULT_ALPHA = 5e-4
+DEFAULT_LEARNING_RATE = 5e-5
+DEFAULT_POSITION_PCT = 0.379
+EARLY_STOP_MIN_DELTA = 1e-3
+DEFAULT_CSV_PATHS = [
+    str(BASE_DIR / "data" / "BTCUSDT_1h.csv"),
+    str(BASE_DIR / "data" / "ETHUSDT_1h.csv"),
+]
+DEFAULT_OUTPUT_DIR = BASE_DIR / "ml_mlp_outputs"
+DEFAULT_SUMMARY_OUTPUT = BASE_DIR / "optimized_strategy_params_mlp_multi.json"
 TARGET_CLASSES = np.array([-1, 0, 1], dtype=int)
 TARGET_LABEL_NAMES = {
     -1: "bearish",
@@ -76,27 +88,42 @@ SEQUENCE_BASE_FEATURES = [
 ]
 
 DEFAULT_PARAMS = {
-    "ENTRY_HMM_CONFIDENCE": 0.65,
-    "ENTRY_MAX_VOLATILITY": 0.055,
-    "ENTRY_MOMENTUM_MIN": 0.0,
-    "ENTRY_VOLUME_ZSCORE_MAX": 2.0,
+    "ENTRY_HMM_CONFIDENCE": 0.586,
+    "ENTRY_MAX_VOLATILITY": 0.657,
+    "ENTRY_MOMENTUM_MIN": 0.0181,
+    "ENTRY_VOLUME_ZSCORE_MAX": 4.284,
     "ENTRY_MA_SHORT": 20,
     "ENTRY_SPREAD_MAX_PCT": 0.05,
     "EXIT_HMM_CONFIDENCE": 0.60,
-    "EXIT_MA_LONG": 50,
-    "EXIT_STOP_LOSS_PCT": 0.03,
+    "EXIT_MA_LONG": 20,
+    "EXIT_STOP_LOSS_PCT": 0.02,
+    "EXIT_TAKE_PROFIT_PCT": 0.02,
 }
+
+OPTIMIZED_PARAMETER_KEYS = [
+    "ENTRY_HMM_CONFIDENCE",
+    "ENTRY_MAX_VOLATILITY",
+    "ENTRY_MOMENTUM_MIN",
+    "ENTRY_VOLUME_ZSCORE_MAX",
+    "ENTRY_MA_SHORT",
+    "ENTRY_SPREAD_MAX_PCT",
+    "EXIT_HMM_CONFIDENCE",
+    "EXIT_MA_LONG",
+]
+FIXED_PARAMETER_KEYS = [
+    "EXIT_STOP_LOSS_PCT",
+    "EXIT_TAKE_PROFIT_PCT",
+]
 
 SEARCH_BOUNDS = {
     "ENTRY_HMM_CONFIDENCE": (0.20, 0.90),
-    "ENTRY_MAX_VOLATILITY": (0.02, 0.20),
+    "ENTRY_MAX_VOLATILITY": (0.05, 4.00),
     "ENTRY_MOMENTUM_MIN": (-0.05, 0.05),
-    "ENTRY_VOLUME_ZSCORE_MAX": (0.50, 5.00),
+    "ENTRY_VOLUME_ZSCORE_MAX": (0.50, 6.00),
     "ENTRY_MA_SHORT": (5, 60),
     "ENTRY_SPREAD_MAX_PCT": (0.01, 0.20),
-    "EXIT_HMM_CONFIDENCE": (0.15, 0.85),
-    "EXIT_MA_LONG": (20, 140),
-    "EXIT_STOP_LOSS_PCT": (0.005, 0.10),
+    "EXIT_HMM_CONFIDENCE": (0.20, 0.90),
+    "EXIT_MA_LONG": (5, 80),
 }
 
 
@@ -117,12 +144,13 @@ def parse_hidden_layers(raw_value: str) -> tuple[int, ...]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train an MLP on Binance OHLCV data and optimize strategy thresholds."
+        description="Train an MLP on crypto OHLCV data and optimize strategy thresholds per asset."
     )
     parser.add_argument(
-        "--csv-path",
-        default=str(BASE_DIR / "binance_data.csv"),
-        help="Path to the historical Binance OHLCV CSV.",
+        "--csv-paths",
+        nargs="+",
+        default=DEFAULT_CSV_PATHS,
+        help="One or more historical OHLCV CSVs. Each asset is trained independently.",
     )
     parser.add_argument(
         "--train-ratio",
@@ -137,10 +165,16 @@ def parse_args() -> argparse.Namespace:
         help="Validation share taken from the end of the training split.",
     )
     parser.add_argument(
+        "--recent-days",
+        type=int,
+        default=DEFAULT_RECENT_DAYS,
+        help="Use only the most recent N days from each CSV before training. Use 0 to keep the full file.",
+    )
+    parser.add_argument(
         "--target-horizon",
         type=int,
         default=12,
-        help="Future horizon in hours for the classifier target.",
+        help="Future horizon in bars for the classifier target.",
     )
     parser.add_argument(
         "--epochs",
@@ -152,30 +186,30 @@ def parse_args() -> argparse.Namespace:
         "--patience",
         type=int,
         default=DEFAULT_PATIENCE,
-        help="Patience window used to flag when validation stopped improving. The plot still runs all requested epochs.",
+        help="Patience window used to mark the first sustained validation plateau; training still runs all requested epochs.",
     )
     parser.add_argument(
         "--hidden-layers",
-        default="128,64,32",
+        default=DEFAULT_HIDDEN_LAYERS,
         help="Comma-separated hidden layer sizes for the MLP.",
     )
     parser.add_argument(
         "--alpha",
         type=float,
-        default=1e-4,
+        default=DEFAULT_ALPHA,
         help="L2 regularization strength for the MLP.",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=5e-4,
+        default=DEFAULT_LEARNING_RATE,
         help="Learning rate for the MLP optimizer.",
     )
     parser.add_argument(
         "--lookback-window",
         type=int,
         default=DEFAULT_LOOKBACK_WINDOW,
-        help="How many hourly feature snapshots to flatten into each ML sample.",
+        help="How many historical bars to flatten into each ML sample.",
     )
     parser.add_argument(
         "--min-move-threshold",
@@ -202,19 +236,14 @@ def parse_args() -> argparse.Namespace:
         help="Minimum preferred number of closed trades before a penalty is applied.",
     )
     parser.add_argument(
-        "--params-output",
-        default=str(BASE_DIR / "optimized_strategy_params.json"),
-        help="Where to save the optimized parameter JSON output.",
+        "--output-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Directory where per-asset plots, parameter reports, and model bundles are saved.",
     )
     parser.add_argument(
-        "--plot-output",
-        default=str(BASE_DIR / "ml_accuracy.png"),
-        help="Where to save the matplotlib training accuracy plot.",
-    )
-    parser.add_argument(
-        "--model-output",
-        default=str(BASE_DIR / "strategy_mlp_model.pkl"),
-        help="Where to save the trained MLP model bundle.",
+        "--summary-output",
+        default=str(DEFAULT_SUMMARY_OUTPUT),
+        help="Where to save the combined multi-asset parameter summary JSON output.",
     )
     parser.add_argument(
         "--seed",
@@ -229,6 +258,40 @@ def parse_args() -> argparse.Namespace:
         help="Starting capital used for the backtest profit simulation summary.",
     )
     return parser.parse_args()
+
+
+def normalize_asset_name(csv_path: Path) -> str:
+    stem = csv_path.stem.upper()
+    asset = stem.split("_")[0]
+    if asset.endswith("USDT"):
+        asset = f"{asset[:-4]}USD"
+    return asset
+
+
+def infer_bar_minutes(frame: pd.DataFrame) -> float:
+    diffs = frame["open_time"].diff().dropna()
+    if diffs.empty:
+        return 60.0
+
+    minutes = diffs.dt.total_seconds() / 60.0
+    minutes = minutes[minutes > 0]
+    if minutes.empty:
+        return 60.0
+
+    return float(minutes.median())
+
+
+def get_frame_annualization_factor(frame: pd.DataFrame) -> float:
+    return float(frame.attrs.get("annualization_factor", ANNUALIZATION_FACTOR))
+
+
+def get_frame_bar_hours(frame: pd.DataFrame) -> float:
+    return float(frame.attrs.get("bar_hours", 1.0))
+
+
+def propagate_frame_attrs(source: pd.DataFrame, target: pd.DataFrame) -> pd.DataFrame:
+    target.attrs = dict(source.attrs)
+    return target
 
 
 def clip_metric(value: float, limit: float = 10.0) -> float:
@@ -247,6 +310,7 @@ def print_epoch_metrics(
     train_loss: float,
     validation_loss: float,
     optimizer_loss: float,
+    best_validation_loss: float,
     best_validation_accuracy: float,
     best_validation_balanced_accuracy: float,
     wait: int,
@@ -269,6 +333,7 @@ def print_epoch_metrics(
         f"train_loss={train_loss:.5f} | "
         f"val_loss={validation_loss:.5f} | "
         f"fit_loss={optimizer_loss:.5f} | "
+        f"best_val_loss={best_validation_loss:.5f} | "
         f"best_val_acc={best_validation_accuracy:.4f} | "
         f"best_val_bal_acc={best_validation_balanced_accuracy:.4f} | "
         f"wait={wait:02d} | "
@@ -330,25 +395,36 @@ def load_feature_frame(
     lookback_window: int,
     min_move_threshold: float,
     neutral_vol_multiplier: float,
+    recent_days: int,
 ) -> tuple[pd.DataFrame, list[str], dict[str, int]]:
     frame = pd.read_csv(csv_path, parse_dates=["open_time"])
     frame = frame.sort_values("open_time").drop_duplicates(subset=["open_time"]).reset_index(drop=True)
+    asset_name = normalize_asset_name(csv_path)
+
+    if recent_days > 0:
+        latest_time = frame["open_time"].max()
+        cutoff = latest_time - pd.Timedelta(days=int(recent_days))
+        frame = frame.loc[frame["open_time"] >= cutoff].reset_index(drop=True)
+
+    bar_minutes = infer_bar_minutes(frame)
+    bar_hours = bar_minutes / 60.0
+    annualization_factor = (60.0 / max(bar_minutes, EPSILON)) * 24.0 * 365.0
 
     frame["log_return"] = np.log(frame["close"] / frame["close"].shift(1))
     frame["return_3"] = frame["close"].pct_change(periods=3)
     frame["return_6"] = frame["close"].pct_change(periods=6)
     frame["return_12"] = frame["close"].pct_change(periods=12)
-    frame["rolling_vol_6"] = frame["log_return"].rolling(window=6).std() * np.sqrt(ANNUALIZATION_FACTOR)
-    frame["rolling_vol_20"] = frame["log_return"].rolling(window=20).std() * np.sqrt(ANNUALIZATION_FACTOR)
-    frame["rolling_vol_48"] = frame["log_return"].rolling(window=48).std() * np.sqrt(ANNUALIZATION_FACTOR)
+    frame["rolling_vol_6"] = frame["log_return"].rolling(window=6).std() * np.sqrt(annualization_factor)
+    frame["rolling_vol_20"] = frame["log_return"].rolling(window=20).std() * np.sqrt(annualization_factor)
+    frame["rolling_vol_48"] = frame["log_return"].rolling(window=48).std() * np.sqrt(annualization_factor)
     frame["momentum_10"] = frame["close"].pct_change(periods=10)
 
     volume_mean = frame["volume"].rolling(window=20).mean()
     volume_std = frame["volume"].rolling(window=20).std()
     frame["volume_zscore_20"] = (frame["volume"] - volume_mean) / (volume_std + EPSILON)
 
-    ma20 = frame["close"].rolling(window=20).mean()
-    ma50 = frame["close"].rolling(window=50).mean()
+    ma20 = frame["close"].ewm(span=20, adjust=False).mean()
+    ma50 = frame["close"].ewm(span=50, adjust=False).mean()
     frame["ma_gap_20_50"] = ma20 / (ma50 + EPSILON) - 1.0
     frame["close_to_ma20"] = frame["close"] / ma20 - 1.0
     frame["close_to_ma50"] = frame["close"] / ma50 - 1.0
@@ -375,10 +451,10 @@ def load_feature_frame(
     frame["estimated_spread_pct"] = spread_proxy * 100.0 * 0.05
 
     frame["future_return"] = frame["close"].shift(-target_horizon) / frame["close"] - 1.0
-    hourly_volatility = frame["rolling_vol_20"] / np.sqrt(ANNUALIZATION_FACTOR)
+    bar_volatility = frame["rolling_vol_20"] / np.sqrt(annualization_factor)
     future_move_threshold = np.maximum(
         min_move_threshold,
-        hourly_volatility * np.sqrt(target_horizon) * neutral_vol_multiplier,
+        bar_volatility * np.sqrt(target_horizon) * neutral_vol_multiplier,
     )
     frame["future_move_threshold"] = future_move_threshold
     frame["target"] = np.select(
@@ -415,6 +491,16 @@ def load_feature_frame(
             f"Target classes are not all present after feature engineering: {class_distribution}"
         )
 
+    frame.attrs["asset_name"] = asset_name
+    frame.attrs["bar_minutes"] = float(bar_minutes)
+    frame.attrs["bar_hours"] = float(bar_hours)
+    frame.attrs["annualization_factor"] = float(annualization_factor)
+    frame.attrs["target_horizon_bars"] = int(target_horizon)
+    frame.attrs["lookback_window_bars"] = int(lookback_window)
+    frame.attrs["recent_days"] = int(recent_days)
+    frame.attrs["start_time"] = frame["open_time"].min().isoformat()
+    frame.attrs["end_time"] = frame["open_time"].max().isoformat()
+
     return frame, model_features, class_distribution
 
 
@@ -425,12 +511,12 @@ def build_splits(frame: pd.DataFrame, train_ratio: float, validation_ratio: floa
         raise ValueError("validation_ratio must be between 0.05 and 0.5.")
 
     split_index = int(len(frame) * train_ratio)
-    train_full = frame.iloc[:split_index].copy()
-    test = frame.iloc[split_index:].copy()
+    train_full = propagate_frame_attrs(frame, frame.iloc[:split_index].copy())
+    test = propagate_frame_attrs(frame, frame.iloc[split_index:].copy())
 
     validation_index = int(len(train_full) * (1.0 - validation_ratio))
-    train = train_full.iloc[:validation_index].copy()
-    validation = train_full.iloc[validation_index:].copy()
+    train = propagate_frame_attrs(train_full, train_full.iloc[:validation_index].copy())
+    validation = propagate_frame_attrs(train_full, train_full.iloc[validation_index:].copy())
 
     if train.empty or validation.empty or test.empty:
         raise ValueError("Split configuration produced an empty train, validation, or test segment.")
@@ -438,41 +524,30 @@ def build_splits(frame: pd.DataFrame, train_ratio: float, validation_ratio: floa
     return SplitData(train=train, validation=validation, train_full=train_full, test=test)
 
 
-def rebalance_training_data(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    seed: int,
-) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
-    rng = np.random.default_rng(seed)
-    class_indices: dict[int, np.ndarray] = {
-        int(label): np.flatnonzero(y_train == label)
+def build_class_balanced_sample_weight(y_train: np.ndarray) -> tuple[np.ndarray, dict[str, int]]:
+    counts = {
+        int(label): int(np.sum(y_train == label))
         for label in TARGET_CLASSES
     }
-
     missing = [
         TARGET_LABEL_NAMES[label]
-        for label, indices in class_indices.items()
-        if len(indices) == 0
+        for label, count in counts.items()
+        if count == 0
     ]
     if missing:
         raise ValueError(f"Training split is missing target classes: {', '.join(missing)}")
 
-    max_count = max(len(indices) for indices in class_indices.values())
-    balanced_indices = []
-
-    for label in TARGET_CLASSES:
-        indices = class_indices[int(label)]
-        sampled = rng.choice(indices, size=max_count, replace=True)
-        balanced_indices.append(sampled)
-
-    balanced_indices = np.concatenate(balanced_indices)
-    rng.shuffle(balanced_indices)
-
+    total = len(y_train)
+    class_weights = {
+        label: total / (len(TARGET_CLASSES) * count)
+        for label, count in counts.items()
+    }
+    sample_weight = np.array([class_weights[int(label)] for label in y_train], dtype=float)
     class_distribution = {
-        TARGET_LABEL_NAMES[int(label)]: int(len(class_indices[int(label)]))
+        TARGET_LABEL_NAMES[int(label)]: counts[int(label)]
         for label in TARGET_CLASSES
     }
-    return X_train[balanced_indices], y_train[balanced_indices], class_distribution
+    return sample_weight, class_distribution
 
 
 def compute_actionable_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -492,8 +567,8 @@ def fit_for_epochs(
     epochs: int,
     seed: int,
 ) -> MLPClassifier:
-    X_balanced_seed, _, _ = rebalance_training_data(X_train=X_train, y_train=y_train, seed=seed)
-    batch_size = min(256, max(32, len(X_balanced_seed) // 10))
+    sample_weight, _ = build_class_balanced_sample_weight(y_train)
+    batch_size = min(128, max(32, len(X_train) // 20))
     model = MLPClassifier(
         hidden_layer_sizes=hidden_layers,
         activation="relu",
@@ -507,15 +582,10 @@ def fit_for_epochs(
     )
 
     for epoch in range(epochs):
-        X_epoch, y_epoch, _ = rebalance_training_data(
-            X_train=X_train,
-            y_train=y_train,
-            seed=seed + epoch,
-        )
         if epoch == 0:
-            model.partial_fit(X_epoch, y_epoch, classes=classes)
+            model.partial_fit(X_train, y_train, classes=classes, sample_weight=sample_weight)
         else:
-            model.partial_fit(X_epoch, y_epoch)
+            model.partial_fit(X_train, y_train, sample_weight=sample_weight)
 
     return model
 
@@ -538,13 +608,9 @@ def train_mlp_classifier(
     scaler = StandardScaler()
     X_train_scaled_unbalanced = scaler.fit_transform(X_train)
     X_validation_scaled = scaler.transform(X_validation)
-    X_train_scaled_seed, _, training_class_distribution = rebalance_training_data(
-        X_train=X_train_scaled_unbalanced,
-        y_train=y_train,
-        seed=seed,
-    )
+    train_sample_weight, training_class_distribution = build_class_balanced_sample_weight(y_train)
 
-    batch_size = min(256, max(32, len(X_train_scaled_seed) // 10))
+    batch_size = min(128, max(32, len(X_train_scaled_unbalanced) // 20))
     model = MLPClassifier(
         hidden_layer_sizes=hidden_layers,
         activation="relu",
@@ -560,6 +626,7 @@ def train_mlp_classifier(
     classes = TARGET_CLASSES.copy()
     history: list[dict[str, float]] = []
     best_epoch = 1
+    best_validation_loss = np.inf
     best_validation_accuracy = -np.inf
     best_validation_balanced_accuracy = -np.inf
     best_checkpoint_found = False
@@ -567,15 +634,19 @@ def train_mlp_classifier(
     early_stop_epoch = None
 
     for epoch in range(1, epochs + 1):
-        X_train_epoch, y_train_epoch, _ = rebalance_training_data(
-            X_train=X_train_scaled_unbalanced,
-            y_train=y_train,
-            seed=seed + epoch,
-        )
         if epoch == 1:
-            model.partial_fit(X_train_epoch, y_train_epoch, classes=classes)
+            model.partial_fit(
+                X_train_scaled_unbalanced,
+                y_train,
+                classes=classes,
+                sample_weight=train_sample_weight,
+            )
         else:
-            model.partial_fit(X_train_epoch, y_train_epoch)
+            model.partial_fit(
+                X_train_scaled_unbalanced,
+                y_train,
+                sample_weight=train_sample_weight,
+            )
 
         train_probabilities = model.predict_proba(X_train_scaled_unbalanced)
         validation_probabilities = model.predict_proba(X_validation_scaled)
@@ -590,9 +661,14 @@ def train_mlp_classifier(
         validation_loss = log_loss(y_validation, validation_probabilities, labels=classes.tolist())
         optimizer_loss = float(model.loss_)
         improved = (
-            validation_balanced_accuracy > best_validation_balanced_accuracy + 1e-6
+            validation_loss < best_validation_loss - EARLY_STOP_MIN_DELTA
             or (
-                abs(validation_balanced_accuracy - best_validation_balanced_accuracy) <= 1e-6
+                abs(validation_loss - best_validation_loss) <= EARLY_STOP_MIN_DELTA
+                and validation_balanced_accuracy > best_validation_balanced_accuracy + 1e-6
+            )
+            or (
+                abs(validation_loss - best_validation_loss) <= EARLY_STOP_MIN_DELTA
+                and abs(validation_balanced_accuracy - best_validation_balanced_accuracy) <= 1e-6
                 and validation_accuracy > best_validation_accuracy + 1e-6
             )
         )
@@ -610,6 +686,7 @@ def train_mlp_classifier(
         )
 
         if improved:
+            best_validation_loss = float(validation_loss)
             best_validation_accuracy = float(validation_accuracy)
             best_validation_balanced_accuracy = float(validation_balanced_accuracy)
             best_epoch = epoch
@@ -631,6 +708,7 @@ def train_mlp_classifier(
             train_loss=float(train_loss),
             validation_loss=float(validation_loss),
             optimizer_loss=optimizer_loss,
+            best_validation_loss=float(best_validation_loss),
             best_validation_accuracy=float(best_validation_accuracy),
             best_validation_balanced_accuracy=float(best_validation_balanced_accuracy),
             wait=wait,
@@ -644,11 +722,7 @@ def train_mlp_classifier(
     scaler_full = StandardScaler()
     X_train_full_unbalanced = scaler_full.fit_transform(split_data.train_full[model_features].to_numpy(dtype=float))
     y_train_full = split_data.train_full["target"].to_numpy(dtype=int)
-    _, _, train_full_class_distribution = rebalance_training_data(
-        X_train=X_train_full_unbalanced,
-        y_train=y_train_full,
-        seed=seed + 1,
-    )
+    _, train_full_class_distribution = build_class_balanced_sample_weight(y_train_full)
     final_model = fit_for_epochs(
         X_train=X_train_full_unbalanced,
         y_train=y_train_full,
@@ -676,6 +750,8 @@ def train_mlp_classifier(
 
     metrics = {
         "best_epoch": int(best_epoch),
+        "epochs_trained": int(len(history)),
+        "best_validation_loss": float(best_validation_loss),
         "best_validation_accuracy": float(best_validation_accuracy),
         "full_train_accuracy": float(full_train_accuracy),
         "full_train_balanced_accuracy": float(full_train_balanced_accuracy),
@@ -685,6 +761,8 @@ def train_mlp_classifier(
         "test_actionable_accuracy": test_actionable_accuracy,
         "selection_train_accuracy": float(history[best_epoch - 1]["train_accuracy"]),
         "selection_train_balanced_accuracy": float(history[best_epoch - 1]["train_balanced_accuracy"]),
+        "selection_train_loss": float(history[best_epoch - 1]["train_loss"]),
+        "selection_validation_loss": float(history[best_epoch - 1]["validation_loss"]),
         "best_validation_balanced_accuracy": float(history[best_epoch - 1]["validation_balanced_accuracy"]),
         "early_stop_epoch": None if early_stop_epoch is None else int(early_stop_epoch),
         "training_class_distribution": training_class_distribution,
@@ -701,18 +779,27 @@ def plot_accuracy_history(
     test_balanced_accuracy: float,
     early_stop_epoch: int | None,
     output_path: Path,
+    asset_name: str,
+    clip_epoch: int | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if clip_epoch is not None:
+        history = [row for row in history if int(row["epoch"]) <= int(clip_epoch)]
+
     epochs = [row["epoch"] for row in history]
     train_accuracy = [row["train_accuracy"] for row in history]
     validation_accuracy = [row["validation_accuracy"] for row in history]
     train_balanced_accuracy = [row["train_balanced_accuracy"] for row in history]
     validation_balanced_accuracy = [row["validation_balanced_accuracy"] for row in history]
+    train_loss = [row["train_loss"] for row in history]
+    validation_loss = [row["validation_loss"] for row in history]
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(epochs, train_accuracy, label="Train accuracy", linewidth=2.0, color="#1d4ed8")
-    plt.plot(epochs, validation_accuracy, label="Validation accuracy", linewidth=2.0, color="#15803d")
-    plt.plot(
+    figure, axes = plt.subplots(2, 1, figsize=(10, 9), sharex=True)
+    accuracy_ax, loss_ax = axes
+
+    accuracy_ax.plot(epochs, train_accuracy, label="Train accuracy", linewidth=2.0, color="#1d4ed8")
+    accuracy_ax.plot(epochs, validation_accuracy, label="Validation accuracy", linewidth=2.0, color="#15803d")
+    accuracy_ax.plot(
         epochs,
         train_balanced_accuracy,
         label="Train balanced accuracy",
@@ -720,7 +807,7 @@ def plot_accuracy_history(
         linestyle="--",
         color="#60a5fa",
     )
-    plt.plot(
+    accuracy_ax.plot(
         epochs,
         validation_balanced_accuracy,
         label="Validation balanced accuracy",
@@ -728,30 +815,50 @@ def plot_accuracy_history(
         linestyle="--",
         color="#4ade80",
     )
-    plt.axvline(best_epoch, color="#b45309", linestyle="--", linewidth=1.5, label=f"Best epoch = {best_epoch}")
+    accuracy_ax.axvline(best_epoch, color="#b45309", linestyle="--", linewidth=1.5, label=f"Best epoch = {best_epoch}")
     if early_stop_epoch is not None:
-        plt.axvline(
+        accuracy_ax.axvline(
             early_stop_epoch,
             color="#dc2626",
             linestyle="-.",
             linewidth=1.2,
             label=f"Patience threshold = {early_stop_epoch}",
         )
-    plt.axhline(test_accuracy, color="#7c3aed", linestyle=":", linewidth=1.5, label=f"Test accuracy = {test_accuracy:.3f}")
-    plt.axhline(
+        loss_ax.axvline(
+            early_stop_epoch,
+            color="#dc2626",
+            linestyle="-.",
+            linewidth=1.2,
+        )
+    accuracy_ax.axhline(
+        test_accuracy,
+        color="#7c3aed",
+        linestyle=":",
+        linewidth=1.5,
+        label=f"Test accuracy = {test_accuracy:.3f}",
+    )
+    accuracy_ax.axhline(
         test_balanced_accuracy,
         color="#f97316",
         linestyle=":",
         linewidth=1.5,
         label=f"Test balanced accuracy = {test_balanced_accuracy:.3f}",
     )
-    plt.title("MLP Accuracy Across Epochs")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.ylim(0.0, 1.0)
-    plt.grid(alpha=0.25)
-    plt.legend()
-    plt.tight_layout()
+    accuracy_ax.set_title(f"{asset_name} MLP Accuracy Across Epochs")
+    accuracy_ax.set_ylabel("Accuracy")
+    accuracy_ax.set_ylim(0.0, 1.0)
+    accuracy_ax.grid(alpha=0.25)
+    accuracy_ax.legend()
+
+    loss_ax.plot(epochs, train_loss, label="Train loss", linewidth=2.0, color="#2563eb")
+    loss_ax.plot(epochs, validation_loss, label="Validation loss", linewidth=2.0, color="#16a34a")
+    loss_ax.axvline(best_epoch, color="#b45309", linestyle="--", linewidth=1.5, label=f"Best epoch = {best_epoch}")
+    loss_ax.set_xlabel("Epoch")
+    loss_ax.set_ylabel("Loss")
+    loss_ax.grid(alpha=0.25)
+    loss_ax.legend()
+
+    figure.tight_layout()
     plt.savefig(output_path, dpi=160, bbox_inches="tight")
     plt.close()
 
@@ -779,11 +886,14 @@ def attach_probabilities(
 
 def get_cached_ma(frame: pd.DataFrame, window: int, cache: dict[int, np.ndarray]) -> np.ndarray:
     if window not in cache:
-        cache[window] = frame["close"].rolling(window=window).mean().to_numpy(dtype=float)
+        cache[window] = frame["close"].ewm(span=window, adjust=False).mean().to_numpy(dtype=float)
     return cache[window]
 
 
-def compute_risk_metrics(returns: np.ndarray) -> dict[str, float]:
+def compute_risk_metrics(
+    returns: np.ndarray,
+    annualization_factor: float,
+) -> dict[str, float]:
     if len(returns) == 0:
         return {
             "objective_raw": -999.0,
@@ -800,8 +910,8 @@ def compute_risk_metrics(returns: np.ndarray) -> dict[str, float]:
     downside = np.minimum(returns, 0.0)
     downside_std = float(np.sqrt(np.mean(np.square(downside))))
 
-    sharpe_ratio = 0.0 if std_return <= EPSILON else mean_return / std_return * np.sqrt(ANNUALIZATION_FACTOR)
-    sortino_ratio = 0.0 if downside_std <= EPSILON else mean_return / downside_std * np.sqrt(ANNUALIZATION_FACTOR)
+    sharpe_ratio = 0.0 if std_return <= EPSILON else mean_return / std_return * np.sqrt(annualization_factor)
+    sortino_ratio = 0.0 if downside_std <= EPSILON else mean_return / downside_std * np.sqrt(annualization_factor)
 
     equity_curve = np.cumprod(np.clip(1.0 + returns, 0.001, None))
     rolling_peak = np.maximum.accumulate(equity_curve)
@@ -812,7 +922,7 @@ def compute_risk_metrics(returns: np.ndarray) -> dict[str, float]:
     if equity_curve[-1] <= EPSILON:
         annualized_return = -1.0
     else:
-        annualized_return = float(equity_curve[-1] ** (ANNUALIZATION_FACTOR / len(returns)) - 1.0)
+        annualized_return = float(equity_curve[-1] ** (annualization_factor / len(returns)) - 1.0)
 
     if max_drawdown < -EPSILON:
         calmar_ratio = annualized_return / abs(max_drawdown)
@@ -846,6 +956,7 @@ def build_simulation_summary(
 
     return {
         "starting_capital": starting_capital,
+        "position_pct": float(DEFAULT_POSITION_PCT * 100.0),
         "ending_capital": float(ending_capital),
         "net_profit": float(net_profit),
         "profit_pct": float(total_return * 100.0),
@@ -892,6 +1003,7 @@ def build_simulation_report(
 def print_simulation_summary(title: str, summary: dict[str, float]) -> None:
     print(title)
     print(f"  Starting capital: ${summary['starting_capital']:,.2f}")
+    print(f"  Position size:    {summary['position_pct']:.2f}%")
     print(f"  Ending capital:   ${summary['ending_capital']:,.2f}")
     print(f"  Net profit:       ${summary['net_profit']:,.2f}")
     print(f"  Profit:           {summary['profit_pct']:.2f}%")
@@ -918,13 +1030,18 @@ def backtest_strategy(
     momentum = frame["momentum_10"].to_numpy(dtype=float)
     volume_zscore = frame["volume_zscore_20"].to_numpy(dtype=float)
     spread_pct = frame["estimated_spread_pct"].to_numpy(dtype=float)
+    annualization_factor = get_frame_annualization_factor(frame)
+    bar_hours = get_frame_bar_hours(frame)
+    position_pct = float(DEFAULT_POSITION_PCT)
 
     ma_short = get_cached_ma(frame, int(params["ENTRY_MA_SHORT"]), ma_cache)
     ma_long = get_cached_ma(frame, int(params["EXIT_MA_LONG"]), ma_cache)
+    fixed_stop_loss = float(DEFAULT_PARAMS["EXIT_STOP_LOSS_PCT"])
+    fixed_take_profit = float(DEFAULT_PARAMS["EXIT_TAKE_PROFIT_PCT"])
 
-    hourly_returns = np.zeros(len(frame), dtype=float)
+    period_returns = np.zeros(len(frame), dtype=float)
     trade_returns: list[float] = []
-    holding_hours: list[int] = []
+    holding_hours: list[float] = []
 
     in_position = False
     exited_this_bar = False
@@ -940,17 +1057,19 @@ def backtest_strategy(
 
         if in_position:
             drawdown = 0.0 if entry_price <= 0 else (entry_price - close[idx]) / entry_price
+            gain = 0.0 if entry_price <= 0 else (close[idx] - entry_price) / entry_price
             should_exit = (
-                drawdown >= params["EXIT_STOP_LOSS_PCT"]
+                drawdown >= fixed_stop_loss
+                or gain >= fixed_take_profit
                 or close[idx] < ma_long[idx]
                 or bearish_prob[idx] > params["EXIT_HMM_CONFIDENCE"]
             )
             if should_exit:
-                exit_cost = spread_pct[idx] / 100.0 / 2.0
-                hourly_returns[idx] -= exit_cost
-                trade_return = (close[idx] / entry_price - 1.0) - entry_cost - exit_cost
+                exit_cost = position_pct * spread_pct[idx] / 100.0 / 2.0
+                period_returns[idx] -= exit_cost
+                trade_return = position_pct * (close[idx] / entry_price - 1.0) - entry_cost - exit_cost
                 trade_returns.append(float(trade_return))
-                holding_hours.append(max(1, idx - entry_index))
+                holding_hours.append(max(1, idx - entry_index) * bar_hours)
                 in_position = False
                 exited_this_bar = True
                 entry_price = 0.0
@@ -958,33 +1077,32 @@ def backtest_strategy(
                 entry_index = -1
 
         if not in_position and not exited_this_bar:
-            should_enter = (
-                bullish_prob[idx] > params["ENTRY_HMM_CONFIDENCE"]
-                and rolling_vol[idx] < params["ENTRY_MAX_VOLATILITY"]
-                and momentum[idx] > params["ENTRY_MOMENTUM_MIN"]
-                and abs(volume_zscore[idx]) < params["ENTRY_VOLUME_ZSCORE_MAX"]
-                and close[idx] >= ma_short[idx]
-                and spread_pct[idx] < params["ENTRY_SPREAD_MAX_PCT"]
-            )
+            hmm_ok = bullish_prob[idx] > params["ENTRY_HMM_CONFIDENCE"]
+            vol_ok = rolling_vol[idx] < params["ENTRY_MAX_VOLATILITY"]
+            mom_ok = momentum[idx] > params["ENTRY_MOMENTUM_MIN"]
+            volume_ok = abs(volume_zscore[idx]) < params["ENTRY_VOLUME_ZSCORE_MAX"]
+            ma_ok = close[idx] > ma_short[idx]
+            spread_ok = spread_pct[idx] < params["ENTRY_SPREAD_MAX_PCT"]
+            should_enter = mom_ok and ma_ok and sum([hmm_ok, vol_ok, volume_ok, spread_ok]) >= 2
             if should_enter:
                 in_position = True
                 entry_price = close[idx]
-                entry_cost = spread_pct[idx] / 100.0 / 2.0
-                hourly_returns[idx] -= entry_cost
+                entry_cost = position_pct * spread_pct[idx] / 100.0 / 2.0
+                period_returns[idx] -= entry_cost
                 entry_index = idx
 
         if in_position:
-            hourly_returns[idx + 1] += close[idx + 1] / close[idx] - 1.0
+            period_returns[idx + 1] += position_pct * (close[idx + 1] / close[idx] - 1.0)
             exposure_hours += 1
 
     if in_position and entry_price > 0:
-        exit_cost = spread_pct[-1] / 100.0 / 2.0
-        hourly_returns[-1] -= exit_cost
-        trade_return = (close[-1] / entry_price - 1.0) - entry_cost - exit_cost
+        exit_cost = position_pct * spread_pct[-1] / 100.0 / 2.0
+        period_returns[-1] -= exit_cost
+        trade_return = position_pct * (close[-1] / entry_price - 1.0) - entry_cost - exit_cost
         trade_returns.append(float(trade_return))
-        holding_hours.append(max(1, len(frame) - 1 - entry_index))
+        holding_hours.append(max(1, len(frame) - 1 - entry_index) * bar_hours)
 
-    metrics = compute_risk_metrics(hourly_returns)
+    metrics = compute_risk_metrics(period_returns, annualization_factor=annualization_factor)
     closed_trades = len(trade_returns)
     trade_penalty = max(0, min_trades - closed_trades) * 0.15
 
@@ -1074,21 +1192,14 @@ def sample_candidates(
                 *SEARCH_BOUNDS["EXIT_HMM_CONFIDENCE"],
                 DEFAULT_PARAMS["EXIT_HMM_CONFIDENCE"],
             ),
-            "EXIT_STOP_LOSS_PCT": sample_float(
+            "EXIT_MA_LONG": sample_int(
                 rng,
-                *SEARCH_BOUNDS["EXIT_STOP_LOSS_PCT"],
-                DEFAULT_PARAMS["EXIT_STOP_LOSS_PCT"],
-                bias_scale=0.15,
+                *SEARCH_BOUNDS["EXIT_MA_LONG"],
+                DEFAULT_PARAMS["EXIT_MA_LONG"],
             ),
+            "EXIT_STOP_LOSS_PCT": DEFAULT_PARAMS["EXIT_STOP_LOSS_PCT"],
+            "EXIT_TAKE_PROFIT_PCT": DEFAULT_PARAMS["EXIT_TAKE_PROFIT_PCT"],
         }
-
-        min_exit_ma = max(candidate["ENTRY_MA_SHORT"] + 5, SEARCH_BOUNDS["EXIT_MA_LONG"][0])
-        candidate["EXIT_MA_LONG"] = sample_int(
-            rng,
-            min_exit_ma,
-            SEARCH_BOUNDS["EXIT_MA_LONG"][1],
-            max(DEFAULT_PARAMS["EXIT_MA_LONG"], min_exit_ma),
-        )
 
         candidate["ENTRY_HMM_CONFIDENCE"] = round(candidate["ENTRY_HMM_CONFIDENCE"], 4)
         candidate["ENTRY_MAX_VOLATILITY"] = round(candidate["ENTRY_MAX_VOLATILITY"], 4)
@@ -1096,7 +1207,6 @@ def sample_candidates(
         candidate["ENTRY_VOLUME_ZSCORE_MAX"] = round(candidate["ENTRY_VOLUME_ZSCORE_MAX"], 4)
         candidate["ENTRY_SPREAD_MAX_PCT"] = round(candidate["ENTRY_SPREAD_MAX_PCT"], 4)
         candidate["EXIT_HMM_CONFIDENCE"] = round(candidate["EXIT_HMM_CONFIDENCE"], 4)
-        candidate["EXIT_STOP_LOSS_PCT"] = round(candidate["EXIT_STOP_LOSS_PCT"], 4)
 
         candidate_key = tuple(candidate[key] for key in DEFAULT_PARAMS.keys())
         if candidate_key in seen:
@@ -1174,17 +1284,21 @@ def save_model_bundle(
     target_horizon: int,
     hidden_layers: Iterable[int],
     lookback_window: int,
+    bar_minutes: float,
+    asset_name: str,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "asset_name": asset_name,
         "scaler": scaler,
         "model": model,
         "feature_columns": model_features,
         "class_labels": [int(label) for label in model.classes_],
         "best_epoch": int(best_epoch),
-        "target_horizon_hours": int(target_horizon),
+        "target_horizon_bars": int(target_horizon),
         "hidden_layers": list(hidden_layers),
-        "lookback_window": int(lookback_window),
+        "lookback_window_bars": int(lookback_window),
+        "bar_interval_minutes": float(bar_minutes),
     }
     with output_path.open("wb") as handle:
         pickle.dump(payload, handle)
@@ -1207,6 +1321,9 @@ def save_parameter_report(
     min_move_threshold: float,
     neutral_vol_multiplier: float,
     starting_capital: float,
+    asset_name: str,
+    bar_minutes: float,
+    recent_days: int,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     simulation_report = build_simulation_report(
@@ -1215,12 +1332,17 @@ def save_parameter_report(
     )
     report = {
         "dataset": {
+            "asset_name": asset_name,
             "csv_path": str(csv_path),
             "rows_after_feature_engineering": int(len(frame)),
+            "recent_days_used": int(recent_days),
+            "start_time": frame.attrs.get("start_time"),
+            "end_time": frame.attrs.get("end_time"),
             "train_rows": int(len(split_data.train_full)),
             "test_rows": int(len(split_data.test)),
-            "target_horizon_hours": int(target_horizon),
-            "lookback_window_hours": int(lookback_window),
+            "bar_interval_minutes": float(bar_minutes),
+            "target_horizon_bars": int(target_horizon),
+            "lookback_window_bars": int(lookback_window),
             "overall_target_distribution": class_distribution,
             "train_target_distribution": summarise_class_distribution(split_data.train_full),
             "validation_target_distribution": summarise_class_distribution(split_data.validation),
@@ -1233,10 +1355,15 @@ def save_parameter_report(
             "hidden_layers": list(hidden_layers),
             "epochs_requested": int(epochs_requested),
             "best_epoch": int(ml_metrics["best_epoch"]),
+            "epochs_trained": int(ml_metrics["epochs_trained"]),
             "early_stop_epoch": ml_metrics["early_stop_epoch"],
             "patience": int(patience),
+            "selection_metric": "lowest validation log loss, then balanced accuracy, then accuracy",
             "selection_train_accuracy": float(ml_metrics["selection_train_accuracy"]),
             "selection_train_balanced_accuracy": float(ml_metrics["selection_train_balanced_accuracy"]),
+            "selection_train_loss": float(ml_metrics["selection_train_loss"]),
+            "selection_validation_loss": float(ml_metrics["selection_validation_loss"]),
+            "best_validation_loss": float(ml_metrics["best_validation_loss"]),
             "best_validation_accuracy": float(ml_metrics["best_validation_accuracy"]),
             "best_validation_balanced_accuracy": float(ml_metrics["best_validation_balanced_accuracy"]),
             "full_train_accuracy": float(ml_metrics["full_train_accuracy"]),
@@ -1258,19 +1385,29 @@ def save_parameter_report(
             "minimum_move_threshold": float(min_move_threshold),
             "neutral_volatility_multiplier": float(neutral_vol_multiplier),
             "rule": (
-                "bullish if future_return > max(min_move_threshold, hourly_vol * sqrt(horizon) * neutral_volatility_multiplier); "
+                "bullish if future_return > max(min_move_threshold, bar_volatility * sqrt(horizon_bars) * neutral_volatility_multiplier); "
                 "bearish if future_return < -that threshold; otherwise neutral"
             ),
         },
         "assumptions": {
+            "training_balance": (
+                "The MLP is trained on the original chronological samples using class-balanced "
+                "sample weights instead of per-epoch random oversampling."
+            ),
             "confidence_source": (
                 "ENTRY_HMM_CONFIDENCE and EXIT_HMM_CONFIDENCE are optimized against "
-                "MLP bullish and bearish class probabilities from a 3-class bull/neutral/bear model."
+                "MLP bullish and bearish class probabilities from a 3-class "
+                "bull/neutral/bear model. EXIT_MA_LONG controls the live long-MA "
+                "exit, while stop-loss and take-profit stay fixed at the config values."
             ),
             "spread_proxy": (
                 "The CSV has no bid/ask spread, so estimated_spread_pct uses 5% of the "
                 "3-candle median intrabar range in percentage points."
             ),
+            "fixed_strategy_parameters": {
+                "EXIT_STOP_LOSS_PCT": DEFAULT_PARAMS["EXIT_STOP_LOSS_PCT"],
+                "EXIT_TAKE_PROFIT_PCT": DEFAULT_PARAMS["EXIT_TAKE_PROFIT_PCT"],
+            },
             "positioning": "Long-only, one position at a time, using close-to-close returns.",
             "cost_model": "Half of the synthetic spread is charged on entry and exit.",
         },
@@ -1287,26 +1424,50 @@ def save_parameter_report(
         json.dump(report, handle, indent=2)
 
 
-def main() -> None:
-    args = parse_args()
-    hidden_layers = parse_hidden_layers(args.hidden_layers)
+def build_asset_artifact_paths(output_dir: Path, asset_name: str) -> dict[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    asset_slug = asset_name.lower()
+    return {
+        "params_output": output_dir / f"optimized_strategy_params_{asset_slug}.json",
+        "plot_output": output_dir / f"ml_accuracy_{asset_slug}.png",
+        "model_output": output_dir / f"strategy_mlp_model_{asset_slug}.pkl",
+    }
 
-    csv_path = Path(args.csv_path).resolve()
-    params_output = Path(args.params_output).resolve()
-    plot_output = Path(args.plot_output).resolve()
-    model_output = Path(args.model_output).resolve()
 
+def save_combined_summary(output_path: Path, payload: dict[str, object]) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def run_asset_pipeline(
+    csv_path: Path,
+    args: argparse.Namespace,
+    hidden_layers: tuple[int, ...],
+    output_dir: Path,
+) -> dict[str, object]:
+    asset_name = normalize_asset_name(csv_path)
+    artifact_paths = build_asset_artifact_paths(output_dir=output_dir, asset_name=asset_name)
+
+    print(f"\n[{asset_name}] Loading dataset from {csv_path}")
     frame, model_features, class_distribution = load_feature_frame(
         csv_path=csv_path,
         target_horizon=args.target_horizon,
         lookback_window=args.lookback_window,
         min_move_threshold=args.min_move_threshold,
         neutral_vol_multiplier=args.neutral_vol_multiplier,
+        recent_days=args.recent_days,
     )
     split_data = build_splits(
         frame=frame,
         train_ratio=args.train_ratio,
         validation_ratio=args.validation_ratio,
+    )
+
+    bar_minutes = float(frame.attrs.get("bar_minutes", 60.0))
+    print(
+        f"[{asset_name}] rows={len(frame)}, bar_interval={bar_minutes:.1f}m, "
+        f"train={len(split_data.train_full)}, test={len(split_data.test)}"
     )
 
     scaler, model, history, ml_metrics = train_mlp_classifier(
@@ -1326,7 +1487,9 @@ def main() -> None:
         test_accuracy=float(ml_metrics["test_accuracy"]),
         test_balanced_accuracy=float(ml_metrics["test_balanced_accuracy"]),
         early_stop_epoch=ml_metrics["early_stop_epoch"],
-        output_path=plot_output,
+        output_path=artifact_paths["plot_output"],
+        asset_name=asset_name,
+        clip_epoch=None,
     )
 
     train_scored = attach_probabilities(split_data.train_full, scaler, model, model_features)
@@ -1340,7 +1503,7 @@ def main() -> None:
     )
 
     save_model_bundle(
-        output_path=model_output,
+        output_path=artifact_paths["model_output"],
         scaler=scaler,
         model=model,
         model_features=model_features,
@@ -1348,9 +1511,11 @@ def main() -> None:
         target_horizon=args.target_horizon,
         hidden_layers=hidden_layers,
         lookback_window=args.lookback_window,
+        bar_minutes=bar_minutes,
+        asset_name=asset_name,
     )
     save_parameter_report(
-        output_path=params_output,
+        output_path=artifact_paths["params_output"],
         csv_path=csv_path,
         frame=frame,
         split_data=split_data,
@@ -1366,6 +1531,9 @@ def main() -> None:
         min_move_threshold=args.min_move_threshold,
         neutral_vol_multiplier=args.neutral_vol_multiplier,
         starting_capital=args.starting_capital,
+        asset_name=asset_name,
+        bar_minutes=bar_minutes,
+        recent_days=args.recent_days,
     )
 
     optimized_test_simulation = build_simulation_summary(
@@ -1377,19 +1545,88 @@ def main() -> None:
         args.starting_capital,
     )
 
-    print(f"Saved optimized parameters to: {params_output}")
-    print(f"Saved MLP accuracy plot to: {plot_output}")
-    print(f"Saved trained model bundle to: {model_output}")
-    print("Best parameters:")
+    print(f"[{asset_name}] Saved optimized parameters to: {artifact_paths['params_output']}")
+    print(f"[{asset_name}] Saved MLP accuracy plot to: {artifact_paths['plot_output']}")
+    print(f"[{asset_name}] Saved trained model bundle to: {artifact_paths['model_output']}")
+    print(f"[{asset_name}] Best parameters:")
     for key, value in optimization_results["best_parameters"].items():
         print(f"  {key} = {value}")
-    print("Model accuracy:")
+    print(f"[{asset_name}] Model accuracy:")
     print(f"  Train accuracy: {ml_metrics['full_train_accuracy']:.4f}")
     print(f"  Test accuracy:  {ml_metrics['test_accuracy']:.4f}")
     print(f"  Test balanced accuracy:  {ml_metrics['test_balanced_accuracy']:.4f}")
     print(f"  Test actionable accuracy: {ml_metrics['test_actionable_accuracy']:.4f}")
-    print_simulation_summary("Simulated optimized bot performance on test split:", optimized_test_simulation)
-    print_simulation_summary("Simulated default bot performance on test split:", default_test_simulation)
+    print_simulation_summary(
+        f"[{asset_name}] Simulated optimized bot performance on test split:",
+        optimized_test_simulation,
+    )
+    print_simulation_summary(
+        f"[{asset_name}] Simulated default bot performance on test split:",
+        default_test_simulation,
+    )
+
+    return {
+        "asset_name": asset_name,
+        "csv_path": str(csv_path),
+        "bar_interval_minutes": bar_minutes,
+        "recent_days_used": int(args.recent_days),
+        "optimized_parameters": optimization_results["best_parameters"],
+        "default_parameters": DEFAULT_PARAMS,
+        "model_accuracy": {
+            "train_accuracy": float(ml_metrics["full_train_accuracy"]),
+            "test_accuracy": float(ml_metrics["test_accuracy"]),
+            "test_balanced_accuracy": float(ml_metrics["test_balanced_accuracy"]),
+            "test_actionable_accuracy": float(ml_metrics["test_actionable_accuracy"]),
+            "best_epoch": int(ml_metrics["best_epoch"]),
+            "best_validation_loss": float(ml_metrics["best_validation_loss"]),
+        },
+        "simulation": {
+            "optimized_test": optimized_test_simulation,
+            "default_test": default_test_simulation,
+        },
+        "artifacts": {
+            key: str(value)
+            for key, value in artifact_paths.items()
+        },
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    hidden_layers = parse_hidden_layers(args.hidden_layers)
+    output_dir = Path(args.output_dir).resolve()
+    summary_output = Path(args.summary_output).resolve()
+
+    csv_paths = [Path(raw_path).resolve() for raw_path in args.csv_paths]
+    asset_summaries: dict[str, object] = {}
+
+    for csv_path in csv_paths:
+        asset_summary = run_asset_pipeline(
+            csv_path=csv_path,
+            args=args,
+            hidden_layers=hidden_layers,
+            output_dir=output_dir,
+        )
+        asset_summaries[asset_summary["asset_name"]] = asset_summary
+
+    combined_summary = {
+        "training_window": {
+            "recent_days_used": int(args.recent_days),
+            "policy": "Each asset is trained on the most recent N days ending at the latest timestamp available in that CSV.",
+        },
+        "strategy_alignment": {
+            "optimized_parameters": OPTIMIZED_PARAMETER_KEYS,
+            "fixed_parameters": FIXED_PARAMETER_KEYS,
+            "exit_logic": (
+                "Stop-loss and take-profit stay fixed at config values, while the "
+                "MLP optimizer tunes the bearish-probability exit and long-MA exit "
+                "to match strategy.py."
+            ),
+        },
+        "assets": asset_summaries,
+    }
+    save_combined_summary(summary_output, combined_summary)
+    print(f"\nSaved combined multi-asset summary to: {summary_output}")
 
 
 if __name__ == "__main__":

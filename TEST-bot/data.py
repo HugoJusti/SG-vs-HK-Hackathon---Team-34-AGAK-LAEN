@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import requests
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from config import (
     DATA_DIR, PAIRS, HMM_TRAINING_HOURS,
     ENTRY_MA_SHORT, EXIT_MA_LONG
@@ -101,17 +101,12 @@ def load_or_fetch_historical(pair: str, force_refresh: bool = False) -> pd.DataF
 
     if not force_refresh and os.path.exists(cache_path):
         df = pd.read_csv(cache_path, parse_dates=["open_time"])
-        last_open_time = df["open_time"].iloc[-1]
-        if getattr(last_open_time, "tzinfo", None) is None:
-            last_open_time = last_open_time.tz_localize(UTC)
-        else:
-            last_open_time = last_open_time.tz_convert(UTC)
-        age_hours = (datetime.now(UTC) - last_open_time).total_seconds() / 3600
+        age_hours = (datetime.utcnow() - df["open_time"].iloc[-1]).total_seconds() / 3600
         if age_hours < 24:
             logger.info(f"Using cached data for {symbol} ({len(df)} candles)")
             return df
 
-    df = fetch_binance_klines(symbol, "1h", HMM_TRAINING_HOURS)
+    df = fetch_binance_klines(symbol, "5m", HMM_TRAINING_HOURS)
     if not df.empty:
         df.to_csv(cache_path, index=False)
     return df
@@ -142,7 +137,8 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # 2. Rolling volatility (20-period, annualised for hourly data)
     #    Annualisation factor: sqrt(24 * 365) ≈ sqrt(8760)
-    df["rolling_vol"] = df["log_return"].rolling(window=20).std() * np.sqrt(8760)
+    # df["rolling_vol"] = df["log_return"].rolling(window=20).std() * np.sqrt(8760)
+    df["rolling_vol"] = df["log_return"].rolling(window=20).std() * np.sqrt(105120)
 
     # 3. Momentum (10-period Rate of Change)
     df["momentum"] = df["close"].pct_change(periods=10)
@@ -153,8 +149,8 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df["volume_zscore"] = (df["volume"] - vol_mean) / vol_std
 
     # Moving averages (trade filters, not HMM features)
-    df["ma20"] = df["close"].rolling(window=ENTRY_MA_SHORT).mean()
-    df["ma50"] = df["close"].rolling(window=EXIT_MA_LONG).mean()
+    df["ma20"] = df["close"].ewm(span=ENTRY_MA_SHORT, adjust=False).mean()
+    df["ma50"] = df["close"].ewm(span=EXIT_MA_LONG, adjust=False).mean()
 
     # Drop NaN rows from rolling calculations
     df = df.dropna().reset_index(drop=True)
@@ -178,9 +174,8 @@ def compute_live_features(historical_df: pd.DataFrame, live_price: float,
     Given the recent historical DataFrame and a new live price/volume,
     compute current feature values for signal checking.
     """
-    history_window = max(EXIT_MA_LONG, ENTRY_MA_SHORT, 21)
-    closes = list(historical_df["close"].values[-history_window:]) + [live_price]
-    volumes = list(historical_df["volume"].values[-history_window:]) + [live_volume]
+    closes = list(historical_df["close"].values[-50:]) + [live_price]
+    volumes = list(historical_df["volume"].values[-50:]) + [live_volume]
 
     closes = np.array(closes)
     volumes = np.array(volumes)
@@ -190,8 +185,8 @@ def compute_live_features(historical_df: pd.DataFrame, live_price: float,
 
     # Rolling vol (last 20 log returns, annualised)
     log_returns = np.diff(np.log(closes[-21:]))
-    rolling_vol = np.std(log_returns) * np.sqrt(8760)
-
+    # rolling_vol = np.std(log_returns) * np.sqrt(8760)
+    rolling_vol = np.std(log_returns) * np.sqrt(105120)
     # Momentum (10-period ROC)
     momentum = (closes[-1] - closes[-11]) / closes[-11]
 
@@ -199,9 +194,14 @@ def compute_live_features(historical_df: pd.DataFrame, live_price: float,
     vol_window = volumes[-20:]
     volume_zscore = (volumes[-1] - np.mean(vol_window)) / (np.std(vol_window) + 1e-10)
 
-    # MAs
-    ma20 = np.mean(closes[-ENTRY_MA_SHORT:])
-    ma50 = np.mean(closes[-EXIT_MA_LONG:])
+    # EMAs (exponential moving averages)
+    alpha20 = 2 / (ENTRY_MA_SHORT + 1)
+    weights20 = np.array([(1 - alpha20) ** i for i in range(20)])[::-1]
+    ma20 = np.sum(weights20 * closes[-20:]) / np.sum(weights20)
+
+    alpha50 = 2 / (EXIT_MA_LONG + 1)
+    weights50 = np.array([(1 - alpha50) ** i for i in range(50)])[::-1]
+    ma50 = np.sum(weights50 * closes[-50:]) / np.sum(weights50)
 
     return {
         "log_return": log_return,
@@ -212,3 +212,12 @@ def compute_live_features(historical_df: pd.DataFrame, live_price: float,
         "ma50": ma50,
         "close": live_price,
     }
+from sklearn.preprocessing import StandardScaler
+
+def get_scaled_hmm_observations(df):
+    """Scale features to zero mean, unit variance for better HMM training."""
+    feature_cols = ["log_return", "rolling_vol", "momentum", "volume_zscore"]
+    raw = df[feature_cols].values
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(raw)
+    return scaled, scaler

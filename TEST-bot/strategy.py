@@ -9,11 +9,10 @@ from hmmlearn.hmm import GaussianHMM
 from config import (
     HMM_N_STATES, HMM_MODEL_DIR,
     ENTRY_HMM_CONFIDENCE, ENTRY_MAX_VOLATILITY, ENTRY_MOMENTUM_MIN,
-    ENTRY_VOLUME_ZSCORE_MAX, ENTRY_MA_SHORT, ENTRY_MA_BUFFER_PCT, ENTRY_SPREAD_MAX_PCT,
-    EXIT_HMM_CONFIDENCE, EXIT_MA_LONG, EXIT_STOP_LOSS_PCT,
+    ENTRY_VOLUME_ZSCORE_MAX, ENTRY_MA_SHORT, ENTRY_SPREAD_MAX_PCT,
+    EXIT_HMM_CONFIDENCE, EXIT_MA_LONG, EXIT_STOP_LOSS_PCT, EXIT_TAKE_PROFIT_PCT,
     MC_NUM_SIMULATIONS, MC_HORIZON_HOURS, MC_MAX_POSITION_PCT,
-    MC_MIN_POSITION_PCT, MC_HIGH_CONFIDENCE_THRESHOLD,
-    MC_LOW_CONFIDENCE_THRESHOLD, MC_TAIL_RISK_LIMIT
+    MC_MIN_POSITION_PCT, MC_TAIL_RISK_LIMIT
 )
 
 logger = logging.getLogger(__name__)
@@ -45,9 +44,6 @@ class RegimeHMM:
         Train HMM on observation matrix (N x 4 features).
         """
         logger.info(f"Training HMM for {pair} on {len(observations)} observations...")
-
-        if observations is None or len(observations) == 0:
-            raise ValueError(f"No HMM observations available for {pair}")
 
         self.model = GaussianHMM(
             n_components=HMM_N_STATES,
@@ -83,7 +79,7 @@ class RegimeHMM:
             return {"bullish": 0.33, "bearish": 0.33, "neutral": 0.34}
 
         # Use last 100 observations for context
-        recent = observations[-100:] if len(observations) > 100 else observations
+        recent = observations[-288:] if len(observations) > 288 else observations
         posteriors = self.model.predict_proba(recent)
         current = posteriors[-1]  # last time step
 
@@ -190,21 +186,13 @@ def monte_carlo_position_size(regime_params: dict, current_regime_idx: int,
     median_return = np.median(final_returns)
     tail_risk = np.percentile(final_returns, 5)
 
-    # Determine position size
+    # Determine position size — MC no longer gates trades, only sizes them
     if tail_risk < -MC_TAIL_RISK_LIMIT:
         # Tail risk too high, use minimum
         position_pct = MC_MIN_POSITION_PCT
-    elif paths_positive >= MC_HIGH_CONFIDENCE_THRESHOLD:
-        # High confidence, size up
-        position_pct = MC_MAX_POSITION_PCT
-    elif paths_positive >= MC_LOW_CONFIDENCE_THRESHOLD:
-        # Medium confidence, scale linearly
-        ratio = (paths_positive - MC_LOW_CONFIDENCE_THRESHOLD) / \
-                (MC_HIGH_CONFIDENCE_THRESHOLD - MC_LOW_CONFIDENCE_THRESHOLD)
-        position_pct = MC_MIN_POSITION_PCT + ratio * (MC_MAX_POSITION_PCT - MC_MIN_POSITION_PCT)
     else:
-        # Low confidence, don't trade
-        position_pct = 0.0
+        # Use maximum position — entry confluences already confirmed the trade
+        position_pct = MC_MAX_POSITION_PCT
 
     result = {
         "position_pct": round(position_pct, 4),
@@ -244,12 +232,7 @@ class SignalGenerator:
             current_position: {"side": "long"/"none", "entry_price": float, "pair": str}
         
         Returns:
-            {
-                "action": "BUY"/"SELL"/"HOLD",
-                "reasons": [str],
-                "confidence": float,
-                "entry_checks": [dict],
-            }
+            {"action": "BUY"/"SELL"/"HOLD", "reasons": [str], "confidence": float}
         """
         action = "HOLD"
         reasons = []
@@ -267,26 +250,34 @@ class SignalGenerator:
                 return {
                     "action": "SELL",
                     "reasons": [f"STOP LOSS: drawdown {drawdown*100:.2f}% >= {EXIT_STOP_LOSS_PCT*100}%"],
-                    "confidence": 1.0,
-                    "entry_checks": [],
+                    "confidence": 1.0
                 }
 
-            # MA50 structural breakdown
+            # Take profit
+            gain = (close - entry_price) / entry_price
+            if gain >= EXIT_TAKE_PROFIT_PCT:
+                return {
+                    "action": "SELL",
+                    "reasons": [f"TAKE PROFIT: gain {gain*100:.2f}% >= {EXIT_TAKE_PROFIT_PCT*100}%"],
+                    "confidence": 1.0
+                }
+
             if close < features["ma50"]:
                 return {
                     "action": "SELL",
-                    "reasons": [f"MA50 BREAKDOWN: close {close:.2f} < MA50 {features['ma50']:.2f}"],
-                    "confidence": 0.9,
-                    "entry_checks": [],
+                    "reasons": [
+                        f"LONG MA EXIT: close={close:.2f} < EMA{EXIT_MA_LONG}={features['ma50']:.2f}"
+                    ],
+                    "confidence": 1.0
                 }
 
-            # HMM bearish regime
             if regime_probs["bearish"] > EXIT_HMM_CONFIDENCE:
                 return {
                     "action": "SELL",
-                    "reasons": [f"HMM BEARISH: P(bear)={regime_probs['bearish']:.3f} > {EXIT_HMM_CONFIDENCE}"],
-                    "confidence": regime_probs["bearish"],
-                    "entry_checks": [],
+                    "reasons": [
+                        f"BEARISH REGIME EXIT: P(bear)={regime_probs['bearish']:.3f} > {EXIT_HMM_CONFIDENCE}"
+                    ],
+                    "confidence": float(regime_probs["bearish"])
                 }
 
         # ── ENTRY LOGIC (all conditions must pass) ──
@@ -295,79 +286,56 @@ class SignalGenerator:
 
             # 1. HMM bullish
             hmm_ok = regime_probs["bullish"] > ENTRY_HMM_CONFIDENCE
-            entry_checks.append({
-                "name": "HMM bullish",
-                "passed": hmm_ok,
-                "detail": f"P(bull)={regime_probs['bullish']:.3f} vs {ENTRY_HMM_CONFIDENCE}",
-            })
+            entry_checks.append(("HMM bullish", hmm_ok,
+                                 f"P(bull)={regime_probs['bullish']:.3f} vs {ENTRY_HMM_CONFIDENCE}"))
 
             # 2. Volatility filter
             vol_ok = features["rolling_vol"] < ENTRY_MAX_VOLATILITY
-            entry_checks.append({
-                "name": "Vol filter",
-                "passed": vol_ok,
-                "detail": f"vol={features['rolling_vol']:.4f} vs {ENTRY_MAX_VOLATILITY}",
-            })
+            entry_checks.append(("Vol filter", vol_ok,
+                                 f"vol={features['rolling_vol']:.4f} vs {ENTRY_MAX_VOLATILITY}"))
 
             # 3. Momentum filter
             mom_ok = features["momentum"] > ENTRY_MOMENTUM_MIN
-            entry_checks.append({
-                "name": "Momentum",
-                "passed": mom_ok,
-                "detail": f"mom={features['momentum']:.6f} vs {ENTRY_MOMENTUM_MIN}",
-            })
+            entry_checks.append(("Momentum", mom_ok,
+                                 f"mom={features['momentum']:.6f} vs {ENTRY_MOMENTUM_MIN}"))
 
             # 4. Volume z-score filter
             vz_ok = abs(features["volume_zscore"]) < ENTRY_VOLUME_ZSCORE_MAX
-            entry_checks.append({
-                "name": "Vol z-score",
-                "passed": vz_ok,
-                "detail": f"|z|={abs(features['volume_zscore']):.3f} vs {ENTRY_VOLUME_ZSCORE_MAX}",
-            })
+            entry_checks.append(("Vol z-score", vz_ok,
+                                 f"|z|={abs(features['volume_zscore']):.3f} vs {ENTRY_VOLUME_ZSCORE_MAX}"))
 
-            # 5. Short-MA confirmation with a small tolerance buffer
-            ma_threshold = features["ma20"] * (1 - ENTRY_MA_BUFFER_PCT)
-            ma_ok = close >= ma_threshold
-            entry_checks.append({
-                "name": f"MA{ENTRY_MA_SHORT} confirm",
-                "passed": ma_ok,
-                "detail": (
-                    f"close={close:.2f} vs MA{ENTRY_MA_SHORT}={features['ma20']:.2f} "
-                    f"(pass if >= {ma_threshold:.2f})"
-                ),
-            })
+            # 5. MA20 confirmation
+            ma_ok = close > features["ma20"]
+            entry_checks.append(("MA20 confirm", ma_ok,
+                                 f"close={close:.2f} vs MA20={features['ma20']:.2f}"))
 
             # 6. Spread filter (Option B — not in HMM, just a gate)
             spread_ok = spread_pct < ENTRY_SPREAD_MAX_PCT
-            entry_checks.append({
-                "name": "Spread filter",
-                "passed": spread_ok,
-                "detail": f"spread={spread_pct:.4f}% vs {ENTRY_SPREAD_MAX_PCT}%",
-            })
-
-            all_pass = all(check["passed"] for check in entry_checks)
+            entry_checks.append(("Spread filter", spread_ok,
+                                 f"spread={spread_pct:.4f}% vs {ENTRY_SPREAD_MAX_PCT}%"))
+            # Momentum and MA20 are mandatory
+            if not mom_ok or not ma_ok:
+                all_pass = 0
+            else:
+                # At least 2 of the remaining 4 must pass
+                remaining = [hmm_ok, vol_ok, vz_ok, spread_ok]
+                all_pass = 1 if sum(remaining) >= 2 else 0
 
             if all_pass:
                 action = "BUY"
-                reasons = [f"[PASS] {c['name']}: {c['detail']}" for c in entry_checks]
             else:
                 action = "HOLD"
-                reasons = [
-                    f"{'[PASS]' if c['passed'] else '[FAIL]'} {c['name']}: {c['detail']}"
-                    for c in entry_checks
-                ]
+            reasons = [f"{'[PASS]' if c[1] else '[FAIL]'} {c[0]}: {c[2]}" for c in entry_checks]
 
             return {
                 "action": action,
                 "reasons": reasons,
-                "confidence": regime_probs.get("bullish", 0) if all_pass else 0.0,
-                "entry_checks": entry_checks,
+                "confidence": regime_probs.get("bullish", 0) if all_pass else 0.0
             }
 
         # Holding position, no exit triggered
         return {
             "action": "HOLD",
             "reasons": ["Position held — no exit conditions met"],
-            "confidence": regime_probs.get("bullish", 0.5),
-            "entry_checks": [],
+            "confidence": regime_probs.get("bullish", 0.5)
         }

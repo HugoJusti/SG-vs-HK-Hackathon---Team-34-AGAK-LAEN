@@ -14,15 +14,15 @@ import time
 import json
 import logging
 import argparse
+import warnings
 import numpy as np
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from config import (
     PAIRS, POLL_INTERVAL_SEC, LOG_DIR, LOG_LEVEL,
-    LOG_SIGNALS_FILE, LOG_ERRORS_FILE, HMM_RETRAIN_INTERVAL_HOURS,
-    LOG_TRADES_FILE, LOG_METRICS_PLOT,
-    ENABLE_METRICS_REPORTING, METRICS_UPDATE_EVERY_CYCLES
+    LOG_SIGNALS_FILE, LOG_ERRORS_FILE, HMM_RETRAIN_INTERVAL_HOURS
 )
 from data import (
     load_or_fetch_historical, compute_features, get_hmm_observations,
@@ -34,9 +34,9 @@ from execution import (
 )
 
 
-# ═══════════════════════════════════════════════════════════════
+# =============================================================
 # LOGGING SETUP
-# ═══════════════════════════════════════════════════════════════
+# =============================================================
 
 def setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -52,49 +52,63 @@ def setup_logging():
     )
 
 
-def build_metrics_report(logger, output_path: str = LOG_METRICS_PLOT):
-    """
-    Build the metrics report without making live trading fail at import time
-    when plotting dependencies are unavailable.
-    """
-    try:
-        from metrics import plot_metrics_report
-    except ImportError as exc:
-        logger.warning(f"Metrics disabled because plotting could not load: {exc}")
-        return None, None
-
-    try:
-        return plot_metrics_report(
-            signals_path=LOG_SIGNALS_FILE,
-            trades_path=LOG_TRADES_FILE,
-            output_path=output_path,
-        )
-    except Exception as exc:
-        logger.warning(f"Metrics refresh failed: {exc}")
-        return None, None
-
-
-def _json_default(value):
-    """Normalize NumPy scalars and datetimes for JSON logging."""
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, datetime):
-        return value.isoformat()
-    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
-
-
-# ═══════════════════════════════════════════════════════════════
+# =============================================================
 # POSITION TRACKER
-# ═══════════════════════════════════════════════════════════════
+# =============================================================
+
+STATE_FILE = "logs/state.json"
+
 
 class PositionTracker:
-    """Track open positions per pair."""
+    """Track open positions per pair, persisted across restarts."""
 
     def __init__(self):
-        # {pair: {"side": "long"/"none", "entry_price": float, "quantity": float}}
         self.positions = {}
         for pair in PAIRS:
             self.positions[pair] = {"side": "none", "entry_price": 0, "quantity": 0}
+        self._load()
+
+    def _load(self):
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                saved = json.load(f)
+            self.positions.update(saved)
+            logging.getLogger("PositionTracker").info("Restored positions: %s", self.positions)
+
+    def _save(self):
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            json.dump(self.positions, f, indent=2)
+
+    def reconcile_positions(self, client):
+        """On startup, verify saved positions match actual exchange balances."""
+        logger = logging.getLogger("PositionTracker")
+        balance = client.get_balance()
+        wallet = balance.get("SpotWallet", balance.get("Wallet", {}))
+
+        for pair in PAIRS:
+            coin = pair.split("/")[0]
+            holding = wallet.get(coin, {})
+            qty = holding.get("Free", 0) + holding.get("Lock", 0)
+            saved = self.positions.get(pair, {})
+
+            if qty > 0 and saved.get("side") != "long":
+                # Exchange has coins but we have no saved position — restore it
+                ticker = client.get_ticker_spread(pair)
+                entry = ticker["last"] if ticker["last"] > 0 else 0
+                self.positions[pair] = {"side": "long", "entry_price": entry, "quantity": qty}
+                logger.warning(
+                    "Reconciled %s: found qty=%.6f on exchange with no saved position. "
+                    "Entry price set to current price $%.2f", pair, qty, entry
+                )
+            elif qty == 0 and saved.get("side") == "long":
+                # We think we have a position but exchange shows nothing
+                logger.warning(
+                    "Reconciled %s: saved position found but no coins on exchange. Clearing.", pair
+                )
+                self.positions[pair] = {"side": "none", "entry_price": 0, "quantity": 0}
+
+        self._save()
 
     def open_position(self, pair: str, entry_price: float, quantity: float):
         self.positions[pair] = {
@@ -102,17 +116,19 @@ class PositionTracker:
             "entry_price": entry_price,
             "quantity": quantity,
         }
+        self._save()
 
     def close_position(self, pair: str):
         self.positions[pair] = {"side": "none", "entry_price": 0, "quantity": 0}
+        self._save()
 
     def get(self, pair: str) -> dict:
         return self.positions.get(pair, {"side": "none", "entry_price": 0, "quantity": 0})
 
 
-# ═══════════════════════════════════════════════════════════════
+# =============================================================
 # MAIN BOT
-# ═══════════════════════════════════════════════════════════════
+# =============================================================
 
 class TradingBot:
     def __init__(self):
@@ -127,235 +143,146 @@ class TradingBot:
         self.historical_data = {}
         self.feature_data = {}
         self.last_train_time = {}
-        self.exchange_info = {}
-        self.metrics_enabled = ENABLE_METRICS_REPORTING
 
         self.logger = logging.getLogger("Bot")
 
-    # ── Initialisation ──
+    # -- Initialisation --
 
     def initialise(self):
         """Fetch historical data and train HMMs for all pairs."""
         self.logger.info("=" * 60)
         self.logger.info("INITIALISING TRADING BOT")
-        self.logger.info(f"Pairs: {PAIRS}")
+        self.logger.info("Pairs: %s", PAIRS)
         self.logger.info("=" * 60)
 
         # Verify API connectivity
         server_time = self.client.get_server_time()
-        self.logger.info(f"Server time: {server_time}")
+        self.logger.info("Server time: %s", server_time)
 
         exchange_info = self.client.get_exchange_info()
         if exchange_info:
-            self.exchange_info = exchange_info
             available = list(exchange_info.get("TradePairs", {}).keys())
-            self.logger.info(f"Available pairs: {available}")
+            self.logger.info("Available pairs: %s", available)
 
         # Fetch data and train HMM for each pair
         for pair in PAIRS:
-            self.logger.info(f"\n--- Setting up {pair} ---")
+            self.logger.info("\n--- Setting up %s ---", pair)
 
             # Load historical data
             df = load_or_fetch_historical(pair)
             if df.empty:
-                self.logger.error(f"No data for {pair}, skipping")
+                self.logger.error("No data for %s, skipping", pair)
                 continue
 
             # Compute features
             df_features = compute_features(df)
-            if df_features.empty:
-                self.logger.error(
-                    f"No usable feature rows for {pair}. "
-                    f"Loaded {len(df)} candles, but rolling features produced 0 rows."
-                )
-                continue
             self.historical_data[pair] = df
             self.feature_data[pair] = df_features
 
-            # Train HMM
+            # Train HMM on raw (unscaled) features
             hmm = RegimeHMM()
             observations = get_hmm_observations(df_features)
-            if len(observations) == 0:
-                self.logger.error(f"No HMM observations available for {pair}, skipping")
-                continue
             hmm.train(observations, pair)
             hmm.save(pair)
             self.hmm_models[pair] = hmm
-            self.last_train_time[pair] = datetime.now(UTC)
+            self.last_train_time[pair] = datetime.utcnow()
 
         # Check balance
         balance = self.client.get_balance()
-        self.logger.info(f"Starting balance: {json.dumps(balance, indent=2)}")
+        self.logger.info("Starting balance: %s", json.dumps(balance, indent=2))
 
-    # ── Main Loop ──
+        # Reconcile saved positions against actual exchange balances
+        self.positions.reconcile_positions(self.client)
+        self.logger.info("Position state after reconciliation: %s", self.positions.positions)
+
+    # -- Main Loop --
 
     def run(self):
         """Main trading loop."""
         self.initialise()
-        self._refresh_metrics(cycle=0, force=True)
         self.logger.info("\n" + "=" * 60)
         self.logger.info("STARTING LIVE TRADING LOOP")
-        self.logger.info(f"Poll interval: {POLL_INTERVAL_SEC}s")
+        self.logger.info("Poll interval: %ss", POLL_INTERVAL_SEC)
         self.logger.info("=" * 60)
 
         cycle = 0
         while True:
             cycle += 1
             try:
-                self.logger.info(f"\n{'-'*40} Cycle {cycle} {'-'*40}")
+                self.logger.info("\n%s Cycle %d %s", "-"*40, cycle, "-"*40)
                 self._trading_cycle()
-                self._refresh_metrics(cycle)
 
             except KeyboardInterrupt:
                 self.logger.info("Shutdown requested. Exiting...")
                 break
             except Exception as e:
-                self.logger.error(f"Error in cycle {cycle}: {e}", exc_info=True)
+                self.logger.error("Error in cycle %d: %s", cycle, e, exc_info=True)
 
             # Check if HMM needs retraining
             self._check_retrain()
 
             # Wait for next cycle
             self.logger.info(
-                f"Rate limiter: {rate_limiter.remaining_calls} calls remaining. "
-                f"Sleeping {POLL_INTERVAL_SEC}s..."
+                "Rate limiter: %d calls remaining. Sleeping %ds...",
+                rate_limiter.remaining_calls, POLL_INTERVAL_SEC
             )
             time.sleep(POLL_INTERVAL_SEC)
 
-    def _get_pair_quantity_constraints(self, pair: str) -> tuple[Decimal | None, int | None]:
-        """Best-effort extraction of quantity step size or precision from exchange info."""
-        trade_pairs = self.exchange_info.get("TradePairs", {}) if isinstance(self.exchange_info, dict) else {}
-        pair_info = trade_pairs.get(pair, {}) if isinstance(trade_pairs, dict) else {}
-
-        step_candidates = [
-            "QuantityStepSize",
-            "QtyStepSize",
-            "stepSize",
-            "StepSize",
-            "LotSize",
-            "lotSize",
-            "MinTradeQuantity",
-            "MinOrderQuantity",
-            "MinQty",
-            "minQty",
-        ]
-        precision_candidates = [
-            "QuantityScale",
-            "QtyScale",
-            "BaseAssetPrecision",
-            "baseAssetPrecision",
-            "quantityPrecision",
-            "QuantityPrecision",
-            "qtyPrecision",
-        ]
-
-        step_size = None
-        for key in step_candidates:
-            value = pair_info.get(key)
-            if value in (None, "", 0, "0"):
-                continue
-            try:
-                parsed = Decimal(str(value))
-                if parsed > 0:
-                    step_size = parsed
-                    break
-            except (InvalidOperation, ValueError):
-                continue
-
-        precision = None
-        for key in precision_candidates:
-            value = pair_info.get(key)
-            if value in (None, ""):
-                continue
-            try:
-                precision = int(value)
-                break
-            except (TypeError, ValueError):
-                continue
-
-        return step_size, precision
-
-    def _quantize_quantity(self, pair: str, quantity: float) -> float:
-        """
-        Snap quantity down to an allowed step size.
-        Falls back to a conservative per-asset decimal precision if exchange
-        metadata is unavailable.
-        """
-        raw_qty = Decimal(str(quantity))
-        step_size, precision = self._get_pair_quantity_constraints(pair)
-
-        if step_size is not None:
-            steps = (raw_qty / step_size).to_integral_value(rounding=ROUND_DOWN)
-            quantized = steps * step_size
-            return float(quantized)
-
-        if precision is None:
-            coin = pair.split("/")[0]
-            precision = 3 if coin == "BTC" else 2 if coin == "ETH" else 4
-
-        quant = Decimal("1").scaleb(-precision)
-        return float(raw_qty.quantize(quant, rounding=ROUND_DOWN))
-
-    def _refresh_metrics(self, cycle: int, force: bool = False):
-        """Refresh the saved metrics chart from the latest bot logs."""
-        if not self.metrics_enabled:
-            return
-
-        if not force and METRICS_UPDATE_EVERY_CYCLES > 1:
-            if cycle % METRICS_UPDATE_EVERY_CYCLES != 0:
-                return
-
-        summary, output_path = build_metrics_report(self.logger, LOG_METRICS_PLOT)
-        if not summary or not output_path:
-            self.metrics_enabled = False
-            return
-
-        total_return = (
-            f"{summary['total_return'] * 100:.2f}%"
-            if not np.isnan(summary["total_return"]) else "n/a"
-        )
-        sharpe = f"{summary['sharpe']:.2f}" if not np.isnan(summary["sharpe"]) else "n/a"
-        max_drawdown = (
-            f"{summary['max_drawdown'] * 100:.2f}%"
-            if not np.isnan(summary["max_drawdown"]) else "n/a"
-        )
-        hit_rate = (
-            f"{summary['hit_rate'] * 100:.2f}%"
-            if not np.isnan(summary["hit_rate"]) else "n/a"
-        )
-
-        self.logger.info(
-            "Metrics updated: %s | closed_trades=%s total_return=%s sharpe=%s max_drawdown=%s hit_rate=%s",
-            output_path,
-            summary["closed_trades"],
-            total_return,
-            sharpe,
-            max_drawdown,
-            hit_rate,
-        )
-
     def _trading_cycle(self):
         """Single iteration: check signals for each pair and act."""
+        balance = self.client.get_balance()
+        wallet = balance.get("SpotWallet", balance.get("Wallet", {}))
+        self.logger.info("--- Portfolio Snapshot ---")
+        usd = wallet.get("USD", {})
+        self.logger.info("  USD   | Free: $%-12s | Lock: $%s",
+                         f"{usd.get('Free', 0):,.2f}", f"{usd.get('Lock', 0):,.2f}")
+        # Show all coins in wallet
+        for coin, amounts in wallet.items():
+            if coin == "USD":
+                continue
+            pair = f"{coin}/USD"
+            pos = self.positions.get(pair)
+
+            # Calculate floating P&L for open positions
+            pnl_str = "N/A"
+            if pos['side'] == "long" and pos['entry_price'] > 0:
+                ticker = self.client.get_ticker_spread(pair)
+                if ticker["last"] > 0:
+                    current_price = ticker["last"]
+                    pnl_pct = (current_price - pos['entry_price']) / pos['entry_price'] * 100
+                    pnl_usd = (current_price - pos['entry_price']) * pos['quantity']
+                    pnl_str = f"{pnl_pct:+.2f}% (${pnl_usd:+,.2f})"
+
+            self.logger.info(
+                "  %-5s | Free: %-12s | Lock: %-12s | Side: %-5s | Entry: $%-12s | Qty: %-14s | PnL: %s",
+                coin,
+                f"{amounts.get('Free', 0):.6f}",
+                f"{amounts.get('Lock', 0):.6f}",
+                pos['side'],
+                f"{pos['entry_price']:,.2f}",
+                f"{pos['quantity']:.6f}",
+                pnl_str
+            )
+        self.logger.info("-" * 26)
         portfolio_value = self.client.get_portfolio_value()
-        self.logger.info(f"Portfolio value: ${portfolio_value:,.2f}")
+        self.logger.info("Portfolio value: $%s", f"{portfolio_value:,.2f}")
 
         for pair in PAIRS:
             if pair not in self.hmm_models:
-                self.logger.warning(f"  Skipping {pair}: no trained HMM available")
                 continue
 
-            self.logger.info(f"\n  -- {pair} --")
+            self.logger.info("\n  -- %s --", pair)
 
             # 1. Get live ticker data
             ticker = self.client.get_ticker_spread(pair)
             if ticker["spread_pct"] >= 999:
-                self.logger.warning(f"  Skipping {pair}: ticker unavailable")
+                self.logger.warning("  Ticker unavailable for %s, skipping", pair)
                 continue
 
             self.logger.info(
-                f"  Price: ${ticker['last']:,.2f} | "
-                f"Bid: ${ticker['bid']:,.2f} | Ask: ${ticker['ask']:,.2f} | "
-                f"Spread: {ticker['spread_pct']:.4f}%"
+                "  Price: $%s | Bid: $%s | Ask: $%s | Spread: %s%%",
+                f"{ticker['last']:,.2f}", f"{ticker['bid']:,.2f}",
+                f"{ticker['ask']:,.2f}", f"{ticker['spread_pct']:.4f}"
             )
 
             # 2. Compute live features
@@ -367,27 +294,33 @@ class TradingBot:
 
             # 3. Get HMM regime probabilities
             hmm = self.hmm_models[pair]
-            # Build observation row for current moment
             obs_row = np.array([[
                 features["log_return"],
                 features["rolling_vol"],
                 features["momentum"],
                 features["volume_zscore"]
             ]])
-            # Append to recent observations for context
+            # Use raw (unscaled) observations for context
             recent_obs = get_hmm_observations(self.feature_data[pair])
             full_obs = np.vstack([recent_obs[-99:], obs_row])
+            self.logger.info("  DEBUG last hist row: %s", recent_obs[-1])
+            self.logger.info("  DEBUG live obs row:  %s", obs_row[0])
             regime_probs = hmm.get_regime_probabilities(full_obs)
-
+            # Also check what happens with ONLY the last 10 rows
+            short_obs = np.vstack([recent_obs[-9:], obs_row])
+            short_probs = hmm.get_regime_probabilities(short_obs)
+            self.logger.info("  DEBUG short context probs: Bull=%.3f Bear=%.3f Neutral=%.3f",
+                short_probs["bullish"], short_probs["bearish"], short_probs["neutral"])
             self.logger.info(
-                f"  Regime: Bull={regime_probs['bullish']:.3f} | "
-                f"Bear={regime_probs['bearish']:.3f} | "
-                f"Neutral={regime_probs['neutral']:.3f}"
+                "  Regime: Bull=%s | Bear=%s | Neutral=%s",
+                f"{regime_probs['bullish']:.3f}",
+                f"{regime_probs['bearish']:.3f}",
+                f"{regime_probs['neutral']:.3f}"
             )
 
             # 4. Check cooldown
             if self.cooldown.is_on_cooldown(pair, regime_probs):
-                self.logger.info(f"  Skipping {pair}: cooldown active")
+                self.logger.info("  %s on cooldown, skipping", pair)
                 continue
 
             # 5. Generate signal
@@ -396,17 +329,13 @@ class TradingBot:
                 regime_probs, features, ticker["spread_pct"], position
             )
 
-            self.logger.info(f"  Signal: {signal['action']}")
+            self.logger.info("  Signal: %s", signal["action"])
             for reason in signal["reasons"]:
-                self.logger.info(f"    {reason}")
+                self.logger.info("    %s", reason)
 
             # 6. Act on signal
             if signal["action"] == "BUY":
-                buy_result = self._execute_buy(pair, ticker, regime_probs, portfolio_value, hmm)
-                if not buy_result:
-                    self.logger.info("  BUY blocked: order execution did not complete successfully")
-                elif buy_result.get("status") != "filled":
-                    self.logger.info(f"  BUY blocked: {buy_result['reason']}")
+                self._execute_buy(pair, ticker, regime_probs, portfolio_value, hmm)
 
             elif signal["action"] == "SELL":
                 self._execute_sell(pair, ticker, signal)
@@ -414,52 +343,54 @@ class TradingBot:
             # Log signal
             self._log_signal(pair, signal, regime_probs, features, ticker)
 
-    # ── Trade Execution ──
+    # -- Trade Execution --
 
-    def _execute_buy(self, pair: str, ticker: dict, regime_probs: dict,
-                     portfolio_value: float, hmm: RegimeHMM):
+    def _execute_buy(self, pair, ticker, regime_probs, portfolio_value, hmm):
         """Run Monte Carlo, size position, execute buy."""
-        # Monte Carlo position sizing
         regime_params = hmm.get_regime_params()
-        current_regime = hmm.bull_idx  # We only buy in bullish regime
+        current_regime = hmm.bull_idx
 
         mc_result = monte_carlo_position_size(
             regime_params, current_regime, portfolio_value
         )
 
         if mc_result["position_pct"] <= 0:
-            self.logger.info(f"  MC says don't trade (position=0%)")
-            return {
-                "status": "blocked",
-                "reason": "Monte Carlo position sizing returned 0%",
-                "mc_result": mc_result,
-            }
+            self.logger.info("  MC says don't trade (position=0%%)")
+            return
 
-        # Calculate quantity
         position_usd = mc_result["position_usd"]
-        price = ticker["ask"]  # worst-case for buys
-        raw_quantity = position_usd / price
-        quantity = self._quantize_quantity(pair, raw_quantity)
+        price = ticker["ask"]
+        coin = pair.split("/")[0]
+
+        quantity = position_usd / price
+
+        exchange_info = self.client.get_exchange_info()
+        pair_info = exchange_info.get("TradePairs", {}).get(pair, {})
+        self.logger.info("  Exchange pair_info for %s: %s", pair, pair_info)
+
+        precision = pair_info.get("AmountPrecision", 6)
+        step = pair_info.get("AmountStep", None)
+
+        if step and step > 0:
+            quantity = int(quantity / step) * step
+            quantity = round(quantity, precision)
+        else:
+            factor = 10 ** precision
+            quantity = int(quantity * factor) / factor
+
+        if quantity * price < 1.0:
+            self.logger.info("  Order too small: $%s < $1.00", f"{quantity * price:.2f}")
+            return
 
         self.logger.info(
-            f"  Quantity normalised for {pair}: raw={raw_quantity:.10f} -> order={quantity:.10f}"
+            "  BUYING %s: qty=%s (~$%s, %s%% of portfolio)",
+            pair, quantity, f"{position_usd:,.0f}",
+            f"{mc_result['position_pct']*100:.1f}"
         )
-
-        if quantity * price < 1.0:  # MiniOrder check
-            self.logger.info(f"  Order too small: ${quantity * price:.2f} < $1.00")
-            return {
-                "status": "blocked",
-                "reason": f"Order value ${quantity * price:.2f} is below $1.00 minimum",
-                "mc_result": mc_result,
-            }
-
         self.logger.info(
-            f"  BUYING {pair}: qty={quantity} (~${position_usd:,.0f}, "
-            f"{mc_result['position_pct']*100:.1f}% of portfolio)"
-        )
-        self.logger.info(
-            f"  MC: {mc_result['paths_positive_pct']*100:.1f}% paths positive, "
-            f"tail risk={mc_result['tail_risk_5pct']*100:.3f}%"
+            "  MC: %s%% paths positive, tail risk=%s%%",
+            f"{mc_result['paths_positive_pct']*100:.1f}",
+            f"{mc_result['tail_risk_5pct']*100:.3f}"
         )
 
         result = self.executor.execute_buy(pair, quantity, ticker)
@@ -467,32 +398,25 @@ class TradingBot:
         if result.get("Success"):
             filled_price = result.get("OrderDetail", {}).get("FilledAverPrice", price)
             if filled_price == 0:
-                filled_price = price  # Pending limit order
+                filled_price = price
             self.positions.open_position(pair, filled_price, quantity)
-            self.logger.info(f"  BUY filled at ${filled_price:,.2f}")
-            return {
-                "status": "filled",
-                "reason": "Order filled",
-                "filled_price": filled_price,
-                "quantity": quantity,
-                "mc_result": mc_result,
-            }
-            self.logger.info(f"  ✓ BUY filled at ${filled_price:,.2f}")
+            self.logger.info("  BUY filled at $%s", f"{filled_price:,.2f}")
         else:
-            self.logger.error(f"  ✗ BUY failed: {result.get('ErrMsg', 'unknown')}")
+            self.logger.error("  BUY failed: %s", result.get("ErrMsg", "unknown"))
 
-    def _execute_sell(self, pair: str, ticker: dict, signal: dict):
+    def _execute_sell(self, pair, ticker, signal):
         """Execute sell and start cooldown."""
         position = self.positions.get(pair)
         quantity = position.get("quantity", 0)
 
         if quantity <= 0:
-            self.logger.warning(f"  No position to sell for {pair}")
+            self.logger.warning("  No position to sell for %s", pair)
             return
 
         self.logger.info(
-            f"  SELLING {pair}: qty={quantity} | "
-            f"Reason: {signal['reasons'][0] if signal['reasons'] else 'unknown'}"
+            "  SELLING %s: qty=%s | Reason: %s",
+            pair, quantity,
+            signal["reasons"][0] if signal["reasons"] else "unknown"
         )
 
         result = self.executor.execute_sell(pair, quantity, ticker)
@@ -506,56 +430,46 @@ class TradingBot:
             self.cooldown.start_cooldown(pair)
 
             self.logger.info(
-                f"  ✓ SELL filled at ${filled_price:,.2f} | "
-                f"PnL: {pnl_pct:+.2f}%"
+                "  SELL filled at $%s | PnL: %s%%",
+                f"{filled_price:,.2f}", f"{pnl_pct:+.2f}"
             )
         else:
-            self.logger.error(f"  ✗ SELL failed: {result.get('ErrMsg', 'unknown')}")
+            self.logger.error("  SELL failed: %s", result.get("ErrMsg", "unknown"))
 
-    # ── HMM Retraining ──
+    # -- HMM Retraining --
 
     def _check_retrain(self):
         """Retrain HMM if enough time has passed."""
         for pair in PAIRS:
             if pair not in self.last_train_time:
                 continue
-            hours_since = (datetime.now(UTC) - self.last_train_time[pair]).total_seconds() / 3600
+            hours_since = (datetime.utcnow() - self.last_train_time[pair]).total_seconds() / 3600
             if hours_since >= HMM_RETRAIN_INTERVAL_HOURS:
-                self.logger.info(f"Retraining HMM for {pair} ({hours_since:.1f}h since last)")
+                self.logger.info("Retraining HMM for %s (%.1fh since last)", pair, hours_since)
                 try:
                     df = load_or_fetch_historical(pair, force_refresh=True)
                     df_features = compute_features(df)
-                    if df_features.empty:
-                        self.logger.error(
-                            f"Retrain skipped for {pair}: "
-                            f"loaded {len(df)} candles, but feature engineering returned 0 rows."
-                        )
-                        continue
                     self.historical_data[pair] = df
                     self.feature_data[pair] = df_features
 
                     obs = get_hmm_observations(df_features)
-                    if len(obs) == 0:
-                        self.logger.error(f"Retrain skipped for {pair}: no HMM observations available")
-                        continue
                     self.hmm_models[pair].train(obs, pair)
                     self.hmm_models[pair].save(pair)
-                    self.last_train_time[pair] = datetime.now(UTC)
+                    self.last_train_time[pair] = datetime.utcnow()
                 except Exception as e:
-                    self.logger.error(f"Retrain failed for {pair}: {e}")
+                    self.logger.error("Retrain failed for %s: %s", pair, e)
 
-    # ── Signal Logging ──
+    # -- Signal Logging --
 
     def _log_signal(self, pair, signal, regime_probs, features, ticker):
         """Log signal details to JSONL file."""
         os.makedirs(LOG_DIR, exist_ok=True)
         entry = {
-            "timestamp": datetime.now(UTC).isoformat(),
+            "timestamp": datetime.utcnow().isoformat(),
             "pair": pair,
             "action": signal["action"],
             "confidence": signal["confidence"],
             "reasons": signal["reasons"],
-            "entry_checks": signal.get("entry_checks", []),
             "regime": regime_probs,
             "features": {k: round(v, 6) if isinstance(v, float) else v
                          for k, v in features.items()},
@@ -568,55 +482,23 @@ class TradingBot:
             "position": self.positions.get(pair),
         }
         with open(LOG_SIGNALS_FILE, "a") as f:
-            f.write(json.dumps(entry, default=_json_default) + "\n")
+            f.write(json.dumps(entry) + "\n")
 
 
-# ═══════════════════════════════════════════════════════════════
+# =============================================================
 # ENTRYPOINT
-# ═══════════════════════════════════════════════════════════════
+# =============================================================
 
 def main():
     parser = argparse.ArgumentParser(description="HMM + Monte Carlo Crypto Trading Bot")
     parser.add_argument("--backtest", action="store_true", help="Run backtest mode")
-    parser.add_argument(
-        "--plot-metrics",
-        action="store_true",
-        help="Build a performance chart from logged signals and trades",
-    )
-    parser.add_argument(
-        "--metrics-output",
-        default=LOG_METRICS_PLOT,
-        help="Where to save the generated metrics chart",
-    )
     args = parser.parse_args()
 
     setup_logging()
     logger = logging.getLogger("Main")
 
-    if args.plot_metrics:
-        summary, output_path = build_metrics_report(logger, args.metrics_output)
-        if not summary or not output_path:
-            logger.error("Could not build metrics report.")
-            sys.exit(1)
-        logger.info(f"Metrics chart saved to {output_path}")
-        logger.info(
-            "Summary | trades=%s total_return=%s sharpe=%s sortino=%s max_drawdown=%s ic=%s hit_rate=%s",
-            summary["closed_trades"],
-            f"{summary['total_return'] * 100:.2f}%"
-            if not np.isnan(summary["total_return"]) else "n/a",
-            f"{summary['sharpe']:.2f}" if not np.isnan(summary["sharpe"]) else "n/a",
-            f"{summary['sortino']:.2f}" if not np.isnan(summary["sortino"]) else "n/a",
-            f"{summary['max_drawdown'] * 100:.2f}%"
-            if not np.isnan(summary["max_drawdown"]) else "n/a",
-            f"{summary['ic']:.2f}" if not np.isnan(summary["ic"]) else "n/a",
-            f"{summary['hit_rate'] * 100:.2f}%"
-            if not np.isnan(summary["hit_rate"]) else "n/a",
-        )
-        sys.exit(0)
-
     if args.backtest:
         logger.info("Backtest mode not yet implemented. Use live mode.")
-        # TODO: implement backtesting loop using historical data
         sys.exit(0)
 
     bot = TradingBot()
