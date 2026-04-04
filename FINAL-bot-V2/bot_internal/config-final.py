@@ -12,7 +12,7 @@ SECRET_KEY = os.getenv("RST_SECRET_KEY", "YOUR_SECRET_KEY_HERE")
 BASE_URL   = "https://mock-api.roostoo.com"
 
 # ── Trading Pairs ────────────────────────────────────────────
-PAIRS = ["TRX/USD", "TAO/USD", "SOL/USD"]  # bullish-trend altcoins
+PAIRS = ["TRX/USD", "TAO/USD", "SOL/USD", "FET/USD", "ALGO/USD"]  # bullish-trend altcoins
 
 # ── Historical Data ──────────────────────────────────────────
 DATA_FETCH_HOURS              = 14 * 24   # 14 days of 5m candles (~4032 candles)
@@ -74,16 +74,8 @@ ENTRY_SPREAD_MAX_PCT = 0.05  # skip pair if bid-ask spread exceeds this
 
 # ── Position Sizing (risk-based) ─────────────────────────────
 RISK_PER_TRADE_PCT = 0.02   # risk 2% of portfolio on each trade
-MAX_POSITION_PCT   = 0.20   # hard cap: no more than 20% per trade (reduced from 30%)
+MAX_POSITION_PCT   = 0.30   # hard cap: no more than 30% per trade
 MIN_POSITION_PCT   = 0.05   # floor: at least 5% if SL is very wide
-
-# ── SL Distance Guards ───────────────────────────────────────
-MAX_SL_DISTANCE_PCT = 0.04  # skip trade if SL is more than 4% below entry (too wide = too much exposure)
-MIN_SL_DISTANCE_PCT = 0.003 # skip trade if SL is less than 0.3% below entry (too tight = noise stop-out)
-
-# ── Drawdown-based Position Scaling ─────────────────────────
-DRAWDOWN_SCALE_THRESHOLD = 0.05   # if portfolio drops 5% from its peak, scale down position size
-DRAWDOWN_SCALE_FACTOR    = 0.50   # scale to 50% of normal size while in drawdown
 
 # ── Stop Loss / Take Profit ──────────────────────────────────
 SL_BUFFER_PCT    = 0.002  # place SL 0.2% below the sweep wick low

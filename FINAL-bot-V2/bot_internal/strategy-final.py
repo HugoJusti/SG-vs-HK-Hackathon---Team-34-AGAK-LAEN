@@ -32,7 +32,6 @@ from config import (
     MIN_CONFLUENCES, CONFLUENCE_WEIGHTS,
     ENTRY_SPREAD_MAX_PCT,
     RISK_PER_TRADE_PCT, MAX_POSITION_PCT, MIN_POSITION_PCT,
-    MAX_SL_DISTANCE_PCT, MIN_SL_DISTANCE_PCT,
     SL_BUFFER_PCT, TP_MIN_PCT, TP_MAX_PCT, MIN_RR_RATIO,
     VOLUME_SPIKE_MULT,
 )
@@ -636,16 +635,11 @@ def compute_confluences(df: pd.DataFrame, sweep_info: dict,
 # ═══════════════════════════════════════════════════════════════
 
 def calculate_position_size(portfolio_value: float, entry_price: float,
-                            sl_price: float,
-                            drawdown_factor: float = 1.0) -> dict:
+                            sl_price: float) -> dict:
     """
     Risk-based sizing: risk RISK_PER_TRADE_PCT of portfolio.
       position_usd = risk_amount / sl_distance_pct
     Clamped to [MIN_POSITION_PCT, MAX_POSITION_PCT].
-
-    drawdown_factor: multiplier applied to position size when in a drawdown.
-      Pass DRAWDOWN_SCALE_FACTOR (e.g. 0.5) when portfolio is below its peak
-      by DRAWDOWN_SCALE_THRESHOLD. Pass 1.0 (default) under normal conditions.
     """
     risk_amount = portfolio_value * RISK_PER_TRADE_PCT
     sl_distance = entry_price - sl_price
@@ -657,24 +651,19 @@ def calculate_position_size(portfolio_value: float, entry_price: float,
         position_usd = portfolio_value * MIN_POSITION_PCT
         sl_dist_pct  = 0.0
 
-    # Apply drawdown scaling before the cap
-    position_usd *= drawdown_factor
-
     min_usd      = portfolio_value * MIN_POSITION_PCT
     max_usd      = portfolio_value * MAX_POSITION_PCT
     position_usd = max(min_usd, min(max_usd, position_usd))
 
-    # Actual risk after clamping and scaling
     actual_risk_usd = position_usd * sl_dist_pct
     actual_risk_pct = actual_risk_usd / portfolio_value if portfolio_value > 0 else 0.0
 
     return {
-        "position_usd":     round(position_usd, 2),
-        "position_pct":     round(position_usd / portfolio_value, 4),
-        "risk_amount":      round(risk_amount, 2),
-        "sl_distance_pct":  round(sl_dist_pct * 100, 4),
-        "actual_risk_pct":  round(actual_risk_pct * 100, 4),
-        "drawdown_factor":  drawdown_factor,
+        "position_usd":    round(position_usd, 2),
+        "position_pct":    round(position_usd / portfolio_value, 4),
+        "risk_amount":     round(risk_amount, 2),
+        "sl_distance_pct": round(sl_dist_pct * 100, 4),
+        "actual_risk_pct": round(actual_risk_pct * 100, 4),
     }
 
 
@@ -921,28 +910,6 @@ class SMCSignalGenerator:
             sl_anchor = min(touch["touch_low"], poi_low)
         sl_price = sl_anchor * (1 - SL_BUFFER_PCT)
         sl_dist  = current_price - sl_price
-
-        # ── SL distance guards ─────────────────────────────────
-        # Too wide: SL > 4% from entry → nominal loss too large even at 20% cap
-        # Too tight: SL < 0.3% from entry → stop is inside normal noise, will get hit randomly
-        sl_dist_pct = sl_dist / current_price if current_price > 0 else 0
-        if sl_dist_pct > MAX_SL_DISTANCE_PCT:
-            return {
-                "action":  "HOLD",
-                "reasons": reasons + [
-                    f"[FAIL SL] SL too wide: {sl_dist_pct*100:.2f}% > max {MAX_SL_DISTANCE_PCT*100:.1f}%",
-                    f"  ->SL={sl_price:.4f} is too far below entry {current_price:.4f} — "
-                    f"nominal exposure too large even at position cap",
-                ],
-            }
-        if sl_dist_pct < MIN_SL_DISTANCE_PCT:
-            return {
-                "action":  "HOLD",
-                "reasons": reasons + [
-                    f"[FAIL SL] SL too tight: {sl_dist_pct*100:.2f}% < min {MIN_SL_DISTANCE_PCT*100:.1f}%",
-                    f"  ->SL={sl_price:.4f} is inside normal noise range — likely to stop out randomly",
-                ],
-            }
 
         # Build market structure for structural TP — skip any high too close for MIN_RR
         structure     = build_market_structure(df)
