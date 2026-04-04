@@ -23,7 +23,7 @@ DATA_REFRESH_INTERVAL_MINUTES = 5        # 5m candles refreshed every new bar
 SWING_LEFT_BARS  = 3    # fractal bars required to the left of swing point
 SWING_RIGHT_BARS = 2    # fractal bars required to the right — reduced from 3 (10-min lag → 5-min)
 SWING_LOOKBACK   = 200  # scan last N candles when detecting swings
-SWING_SIGNIFICANCE_ATR_MULT = 0.3  # pivot must stand out by ≥ 0.3× ATR from neighbours to count as structural
+SWING_SIGNIFICANCE_ATR_MULT = 0.2  # pivot must stand out by ≥ 0.2× ATR from neighbours to count as structural
 
 # ── Support Zones ────────────────────────────────────────────
 ZONE_MARGIN_PCT = 0.003  # cluster swing lows within 0.3% of each other
@@ -35,9 +35,9 @@ SWEEP_WICK_RATIO_MIN = 0.30   # lower wick must be ≥ 30% of total candle range
 POI_TOUCH_LOOKBACK   = 50     # candles to look back for a POI touch (50 bars = 4.2 hours)
 
 # ── Break of Structure ───────────────────────────────────────
-BOS_LOOKBACK          = 5    # look back N candles for the most recent swing high
+BOS_LOOKBACK          = 10   # look back N candles for the most recent swing high
 BOS_CLOSE_BUFFER_PCT  = 0.001  # close must be ≥ 0.1% above BOS level — filters marginal breaks
-BOS_MAX_AGE_CANDLES   = 10    # skip entry if BOS fired more than N candles ago (stale setup)
+BOS_MAX_AGE_CANDLES   = 5    # skip entry if BOS fired more than N candles ago (stale setup)
 
 # ── Indicators ───────────────────────────────────────────────
 RSI_PERIOD         = 14
@@ -81,7 +81,7 @@ MIN_POSITION_PCT   = 0.05   # floor: at least 5% if SL is very wide
 SL_BUFFER_PCT    = 0.002  # place SL 0.2% below the sweep wick low
 TP_MIN_PCT       = 0.008  # minimum take profit of 0.8%
 TP_MAX_PCT       = 0.04   # cap take profit at 4%
-MIN_RR_RATIO     = 1.5    # minimum reward:risk ratio — skip trade if TP can't reach this
+MIN_RR_RATIO     = 2.0  # minimum reward:risk ratio — skip trade if TP can't reach this
 RECONCILE_SL_PCT = 0.03   # fallback SL for reconciled positions: 3% below current price
 
 # ── Concurrent Positions ────────────────────────────────────
