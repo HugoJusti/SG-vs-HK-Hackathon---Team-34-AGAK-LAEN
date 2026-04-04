@@ -385,29 +385,35 @@ class CooldownManager:
         self._save()
         logger.info(f"Cooldown started for {pair}")
 
-    def is_on_cooldown(self, pair: str, regime_probs: dict) -> bool:
-        """Check if pair is still on cooldown."""
+    def is_on_cooldown(self, pair: str, regime_probs: dict = None) -> bool:
+        """
+        Check if pair is still on cooldown.
+        regime_probs is optional; if omitted only the time gate is applied.
+        """
         if pair not in self.cooldowns:
             return False
 
-        cd = self.cooldowns[pair]
+        cd      = self.cooldowns[pair]
         elapsed = (datetime.utcnow() - cd["exit_time"]).total_seconds() / 60
 
         if elapsed < COOLDOWN_MIN_MINUTES:
             logger.debug(f"{pair} cooldown: {elapsed:.0f}/{COOLDOWN_MIN_MINUTES} min elapsed")
             return True
 
-        max_prob = max(regime_probs.values())
-        if max_prob >= COOLDOWN_STABILITY_THRESHOLD:
-            cd["stability_count"] += 1
-        else:
-            cd["stability_count"] = 0
+        # Stability check — only when regime_probs are supplied (HMM-based path)
+        if regime_probs is not None:
+            max_prob = max(regime_probs.values())
+            if max_prob >= COOLDOWN_STABILITY_THRESHOLD:
+                cd["stability_count"] += 1
+            else:
+                cd["stability_count"] = 0
 
-        if cd["stability_count"] < COOLDOWN_STABILITY_CHECKS:
-            logger.debug(
-                f"{pair} cooldown: stable checks {cd['stability_count']}/{COOLDOWN_STABILITY_CHECKS}"
-            )
-            return True
+            if cd["stability_count"] < COOLDOWN_STABILITY_CHECKS:
+                logger.debug(
+                    f"{pair} cooldown: stable checks "
+                    f"{cd['stability_count']}/{COOLDOWN_STABILITY_CHECKS}"
+                )
+                return True
 
         logger.info(f"{pair} cooldown complete after {elapsed:.0f} minutes")
         del self.cooldowns[pair]

@@ -1,213 +1,188 @@
 """
-Data module: historical data fetching, feature engineering, and live ticker.
+Data module: historical data fetching and SMC indicator computation.
+
+Fetches OHLCV from Binance public API (no key required) and computes
+all indicators needed by the SMC strategy:
+  RSI, MACD, EMA50, Volume MA, ATR
+
+Also fetches 1H higher-timeframe (HTF) data used for the macro trend gate.
 """
 import os
 import time
-import numpy as np
 import pandas as pd
 import requests
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from config import (
-    DATA_DIR, PAIRS, HMM_TRAINING_HOURS,
-    ENTRY_MA_SHORT, EXIT_MA_LONG
+    DATA_DIR, PAIRS, DATA_FETCH_HOURS,
+    RSI_PERIOD, MACD_FAST, MACD_SLOW, MACD_SIGNAL_PERIOD,
+    EMA_TREND_PERIOD, VOLUME_MA_PERIOD,
+    HTF_INTERVAL, HTF_FETCH_DAYS,
 )
 
 logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
-# BINANCE HISTORICAL DATA (for HMM training)
+# BINANCE HISTORICAL DATA
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_binance_klines(symbol: str, interval: str = "5m",
-                         limit_hours: int = HMM_TRAINING_HOURS) -> pd.DataFrame:
+                         limit_hours: int = DATA_FETCH_HOURS) -> pd.DataFrame:
     """
-    Fetch historical klines from Binance public API.
-    symbol: e.g. "BTCUSDT", "ETHUSDT"
-    interval: "5m", "1h", "4h", "1d", etc.
-    Returns DataFrame with OHLCV + timestamp.
+    Fetch historical OHLCV klines from Binance public API (no auth needed).
+    symbol   : e.g. "TRXUSDT", "TAOUSDT"
+    interval : "5m", "1h", "4h", "1d", etc.
+    Paginates automatically since Binance caps at 1000 candles per request.
     """
-    url = "https://api.binance.com/api/v3/klines"
-    all_klines = []
+    url      = "https://api.binance.com/api/v3/klines"
+    end_ms   = int(time.time() * 1000)
+    start_ms = end_ms - (limit_hours * 3600 * 1000)
+    current  = start_ms
+    all_rows = []
 
-    # Binance returns max 1000 candles per request, so we paginate
-    end_time = int(time.time() * 1000)
-    start_time = end_time - (limit_hours * 3600 * 1000)
-    current_start = start_time
+    logger.info(f"Fetching {limit_hours}h of {interval} candles for {symbol}…")
 
-    logger.info(f"Fetching {limit_hours} hours of {interval} klines for {symbol}...")
-
-    while current_start < end_time:
+    while current < end_ms:
         params = {
-            "symbol": symbol,
-            "interval": interval,
-            "startTime": current_start,
-            "endTime": end_time,
-            "limit": 1000
+            "symbol":    symbol,
+            "interval":  interval,
+            "startTime": current,
+            "endTime":   end_ms,
+            "limit":     1000,
         }
         try:
             resp = requests.get(url, params=params, timeout=10)
             resp.raise_for_status()
             data = resp.json()
-
             if not data:
                 break
-
-            all_klines.extend(data)
-            # Move start to after last candle
-            current_start = data[-1][0] + 1
-
-            # Be nice to Binance API
+            all_rows.extend(data)
+            current = data[-1][0] + 1
             time.sleep(0.2)
-
         except requests.exceptions.RequestException as e:
-            logger.error(f"Binance API error: {e}")
+            logger.error(f"Binance API error for {symbol}: {e}")
             time.sleep(1)
             continue
 
-    if not all_klines:
-        logger.error(f"No kline data fetched for {symbol}")
+    if not all_rows:
+        logger.error(f"No kline data returned for {symbol}")
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_klines, columns=[
+    df = pd.DataFrame(all_rows, columns=[
         "open_time", "open", "high", "low", "close", "volume",
         "close_time", "quote_volume", "num_trades",
-        "taker_buy_volume", "taker_buy_quote_volume", "ignore"
+        "taker_buy_volume", "taker_buy_quote_volume", "ignore",
     ])
-
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
+    for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
 
-    df = df[["open_time", "open", "high", "low", "close", "volume"]].copy()
-    df = df.drop_duplicates(subset=["open_time"]).sort_values("open_time").reset_index(drop=True)
+    df = (df[["open_time", "open", "high", "low", "close", "volume"]]
+          .drop_duplicates(subset=["open_time"])
+          .sort_values("open_time")
+          .reset_index(drop=True))
 
     logger.info(f"Fetched {len(df)} candles for {symbol}")
     return df
 
 
 def pair_to_binance_symbol(pair: str) -> str:
-    """Convert 'BTC/USD' → 'BTCUSDT' for Binance API."""
-    coin = pair.split("/")[0]
-    return f"{coin}USDT"
+    """'TRX/USD' → 'TRXUSDT'"""
+    return pair.split("/")[0] + "USDT"
 
 
 def load_or_fetch_historical(pair: str, force_refresh: bool = False) -> pd.DataFrame:
-    """Load cached data or fetch fresh from Binance."""
+    """
+    Load 5m data from local CSV cache (if < 1h old), otherwise fetch from Binance.
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
-    symbol = pair_to_binance_symbol(pair)
-    cache_path = os.path.join(DATA_DIR, f"{symbol}_1h.csv")
+    symbol     = pair_to_binance_symbol(pair)
+    cache_path = os.path.join(DATA_DIR, f"{symbol}_5m.csv")
 
     if not force_refresh and os.path.exists(cache_path):
-        df = pd.read_csv(cache_path, parse_dates=["open_time"])
-        age_hours = (datetime.utcnow() - df["open_time"].iloc[-1]).total_seconds() / 3600
-        if age_hours < 24:
-            logger.info(f"Using cached data for {symbol} ({len(df)} candles)")
+        df    = pd.read_csv(cache_path, parse_dates=["open_time"])
+        age_h = (datetime.utcnow() - df["open_time"].iloc[-1]).total_seconds() / 3600
+        if age_h < 1:
+            logger.info(f"Using cached 5m data for {symbol} ({len(df)} candles, {age_h:.1f}h old)")
             return df
 
-    df = fetch_binance_klines(symbol, "5m", HMM_TRAINING_HOURS)
+    df = fetch_binance_klines(symbol, "5m", DATA_FETCH_HOURS)
+    if not df.empty:
+        df.to_csv(cache_path, index=False)
+    return df
+
+
+def load_or_fetch_htf(pair: str, force_refresh: bool = False) -> pd.DataFrame:
+    """
+    Load 1H (HTF) data from local CSV cache (if < 4h old), otherwise fetch from Binance.
+    Used for the macro trend gate: entry blocked when 1H close < 1H EMA50.
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+    symbol     = pair_to_binance_symbol(pair)
+    cache_path = os.path.join(DATA_DIR, f"{symbol}_{HTF_INTERVAL}.csv")
+
+    if not force_refresh and os.path.exists(cache_path):
+        df    = pd.read_csv(cache_path, parse_dates=["open_time"])
+        age_h = (datetime.utcnow() - df["open_time"].iloc[-1]).total_seconds() / 3600
+        if age_h < 4:
+            logger.info(f"Using cached {HTF_INTERVAL} data for {symbol} ({len(df)} candles)")
+            return df
+
+    df = fetch_binance_klines(symbol, HTF_INTERVAL, HTF_FETCH_DAYS * 24)
     if not df.empty:
         df.to_csv(cache_path, index=False)
     return df
 
 
 # ═══════════════════════════════════════════════════════════════
-# FEATURE ENGINEERING (for HMM observations)
+# SMC INDICATOR COMPUTATION
 # ═══════════════════════════════════════════════════════════════
 
-def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_smc_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute the 4 HMM observation features + EMA indicators.
+    Add all SMC-relevant indicators to the OHLCV DataFrame.
 
-    Features:
-      1. log_return:    ln(close_t / close_{t-1})
-      2. rolling_vol:   20-period rolling std of log returns (annualised)
-      3. momentum:      10-period rate of change
-      4. volume_zscore: (volume - rolling_mean) / rolling_std
+    Added columns:
+      rsi          — RSI (RSI_PERIOD bars)
+      macd         — MACD line (EMA_FAST - EMA_SLOW)
+      macd_signal  — MACD signal line
+      macd_hist    — MACD histogram
+      ema50        — EMA trend filter (EMA_TREND_PERIOD)
+      vol_ma       — Volume moving average (VOLUME_MA_PERIOD)
+      atr          — Average True Range (14 bars) — used for TP calculation
 
-    Indicators (not HMM features, used as trade filters):
-      - ma20: 20-period EMA
-      - ma50: 50-period EMA
+    Drops rows with NaN (warmup period) and resets the index.
     """
     df = df.copy()
 
-    # 1. Log returns
-    df["log_return"] = np.log(df["close"] / df["close"].shift(1))
+    # ── RSI ──────────────────────────────────────────────────────
+    delta  = df["close"].diff()
+    gain   = delta.clip(lower=0).rolling(RSI_PERIOD).mean()
+    loss   = (-delta.clip(upper=0)).rolling(RSI_PERIOD).mean()
+    rs     = gain / (loss + 1e-10)
+    df["rsi"] = 100 - (100 / (1 + rs))
 
-    # 2. Rolling volatility (20-period, annualised for 5m data)
-    #    Annualisation factor: sqrt(12 * 24 * 365) = sqrt(105120)
-    df["rolling_vol"] = df["log_return"].rolling(window=20).std() * np.sqrt(105120)
+    # ── MACD ─────────────────────────────────────────────────────
+    ema_fast          = df["close"].ewm(span=MACD_FAST,   adjust=False).mean()
+    ema_slow          = df["close"].ewm(span=MACD_SLOW,   adjust=False).mean()
+    df["macd"]        = ema_fast - ema_slow
+    df["macd_signal"] = df["macd"].ewm(span=MACD_SIGNAL_PERIOD, adjust=False).mean()
+    df["macd_hist"]   = df["macd"] - df["macd_signal"]
 
-    # 3. Momentum (10-period Rate of Change)
-    df["momentum"] = df["close"].pct_change(periods=10)
+    # ── EMA50 trend filter ────────────────────────────────────────
+    df["ema50"] = df["close"].ewm(span=EMA_TREND_PERIOD, adjust=False).mean()
 
-    # 4. Volume z-score (20-period rolling)
-    vol_mean = df["volume"].rolling(window=20).mean()
-    vol_std = df["volume"].rolling(window=20).std()
-    df["volume_zscore"] = (df["volume"] - vol_mean) / vol_std
+    # ── Volume MA ─────────────────────────────────────────────────
+    df["vol_ma"] = df["volume"].rolling(VOLUME_MA_PERIOD).mean()
 
-    # EMAs (exponential moving averages — trade filters, not HMM features)
-    df["ma20"] = df["close"].ewm(span=ENTRY_MA_SHORT, adjust=False).mean()
-    df["ma50"] = df["close"].ewm(span=EXIT_MA_LONG, adjust=False).mean()
+    # ── ATR (14-bar) ──────────────────────────────────────────────
+    tr        = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"]  - df["close"].shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(14).mean()
 
-    # Drop NaN rows from rolling calculations
     df = df.dropna().reset_index(drop=True)
-
     return df
-
-
-def get_hmm_observations(df: pd.DataFrame) -> np.ndarray:
-    """Extract the 4 HMM feature columns as a numpy array."""
-    feature_cols = ["log_return", "rolling_vol", "momentum", "volume_zscore"]
-    return df[feature_cols].values
-
-
-# ═══════════════════════════════════════════════════════════════
-# LIVE DATA HELPERS
-# ═══════════════════════════════════════════════════════════════
-
-def compute_live_features(historical_df: pd.DataFrame, live_price: float,
-                          live_volume: float) -> dict:
-    """
-    Given the recent historical DataFrame and a new live price/volume,
-    compute current feature values for signal checking.
-    """
-    closes = list(historical_df["close"].values[-50:]) + [live_price]
-    volumes = list(historical_df["volume"].values[-50:]) + [live_volume]
-
-    closes = np.array(closes)
-    volumes = np.array(volumes)
-
-    # Log return
-    log_return = np.log(closes[-1] / closes[-2])
-
-    # Rolling vol (last 20 log returns, annualised for 5m)
-    log_returns = np.diff(np.log(closes[-21:]))
-    rolling_vol = np.std(log_returns) * np.sqrt(105120)
-
-    # Momentum (10-period ROC)
-    momentum = (closes[-1] - closes[-11]) / closes[-11]
-
-    # Volume z-score
-    vol_window = volumes[-20:]
-    volume_zscore = (volumes[-1] - np.mean(vol_window)) / (np.std(vol_window) + 1e-10)
-
-    # EMAs
-    alpha20 = 2 / (ENTRY_MA_SHORT + 1)
-    weights20 = np.array([(1 - alpha20) ** i for i in range(20)])[::-1]
-    ma20 = np.sum(weights20 * closes[-20:]) / np.sum(weights20)
-
-    alpha50 = 2 / (EXIT_MA_LONG + 1)
-    weights50 = np.array([(1 - alpha50) ** i for i in range(50)])[::-1]
-    ma50 = np.sum(weights50 * closes[-50:]) / np.sum(weights50)
-
-    return {
-        "log_return": log_return,
-        "rolling_vol": rolling_vol,
-        "momentum": momentum,
-        "volume_zscore": volume_zscore,
-        "ma20": ma20,
-        "ma50": ma50,
-        "close": live_price,
-    }

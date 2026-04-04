@@ -1,6 +1,5 @@
 """
-Configuration for the HMM + Monte Carlo Trading Bot
-All tunable parameters in one place.
+Configuration for the SMC + Confluence Trading Bot.
 """
 import os
 from dotenv import load_dotenv
@@ -8,71 +7,101 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Roostoo API ──────────────────────────────────────────────
-API_KEY = os.getenv("RST_API_KEY", "YOUR_API_KEY_HERE")
+API_KEY    = os.getenv("RST_API_KEY",    "YOUR_API_KEY_HERE")
 SECRET_KEY = os.getenv("RST_SECRET_KEY", "YOUR_SECRET_KEY_HERE")
-BASE_URL = "https://mock-api.roostoo.com"
+BASE_URL   = "https://mock-api.roostoo.com"
 
 # ── Trading Pairs ────────────────────────────────────────────
-PAIRS = ["BTC/USD", "ETH/USD", "SOL/USD", "BNB/USD"]
+PAIRS = ["TRX/USD", "TAO/USD", "SOL/USD"]  # bullish-trend altcoins
 
-# ── HMM Settings ─────────────────────────────────────────────
-HMM_N_STATES = 3                # bullish, bearish, neutral
-HMM_FEATURES = [                # observation features fed to HMM
-    "log_return",
-    "rolling_vol",
-    "momentum",
-    "volume_zscore",
-]
-HMM_TRAINING_HOURS = 1 * 60 * 24    # 2 month
-HMM_RETRAIN_INTERVAL_HOURS = 24     # retrain HMM every 24 hours
+# ── Historical Data ──────────────────────────────────────────
+DATA_FETCH_HOURS            = 14 * 24   # 14 days of 5m candles (~4032 candles)
+DATA_REFRESH_INTERVAL_HOURS = 1         # re-fetch every hour during live run
 
-# ── Entry Thresholds ─────────────────────────────────────────
-ENTRY_HMM_CONFIDENCE = 0.494     # P(bullish) must exceed this
-ENTRY_MAX_VOLATILITY = 0.1997     # annualised rolling vol cap
-ENTRY_MOMENTUM_MIN = -0.0346     # 10-period ROC must be > this
-ENTRY_VOLUME_ZSCORE_MAX = 4.5283  # |z| must be below this
-ENTRY_MA_SHORT = 8             # close > EMA8 required
-ENTRY_SPREAD_MAX_PCT = 0.0362     # bid-ask spread filter
+# ── Swing Structure Detection ────────────────────────────────
+SWING_LEFT_BARS  = 3    # fractal bars required to the left of swing point
+SWING_RIGHT_BARS = 2    # fractal bars required to the right — reduced from 3 (10-min lag → 5-min)
+SWING_LOOKBACK   = 200  # scan last N candles when detecting swings
+SWING_SIGNIFICANCE_ATR_MULT = 0.3  # pivot must stand out by ≥ 0.3× ATR from neighbours to count as structural
 
-# ── Exit Thresholds ──────────────────────────────────────────
-EXIT_HMM_CONFIDENCE = 0.6087      # unused — kept for reference
-EXIT_MA_LONG = 20               # unused — kept for reference
-EXIT_STOP_LOSS_PCT = 0.007      # 0.7% drawdown hard stop
-EXIT_TAKE_PROFIT_PCT = 0.007    # 0.7% gain take profit
+# ── Support Zones ────────────────────────────────────────────
+ZONE_MARGIN_PCT = 0.003  # cluster swing lows within 0.3% of each other
 
-# ── Monte Carlo Position Sizing ──────────────────────────────
-MC_NUM_SIMULATIONS = 1000       # number of forward paths
-MC_HORIZON_HOURS = 24           # how far forward to simulate
-MC_MAX_POSITION_PCT = 0.30      # max 30% of portfolio per trade
-MC_MIN_POSITION_PCT = 0.05      # min 5% if tail risk too high
-MC_HIGH_CONFIDENCE_THRESHOLD = 0.85
-MC_LOW_CONFIDENCE_THRESHOLD = 0.60
-MC_TAIL_RISK_LIMIT = 0.02       # 5th percentile loss cap (2%)
+# ── Liquidity Sweep ──────────────────────────────────────────
+SWEEP_TOLERANCE_PCT  = 0.001  # min 0.1% wick below zone to qualify
+SWEEP_LOOKBACK       = 10     # check last N completed candles for a sweep
+SWEEP_WICK_RATIO_MIN = 0.30   # lower wick must be ≥ 30% of total candle range
+
+# ── Break of Structure ───────────────────────────────────────
+BOS_LOOKBACK     = 30     # look back N candles for the most recent swing high
+BOS_LIVE_BUFFER  = 0.001  # live price must exceed BOS level by 0.1% to avoid wick entries
+
+# ── Indicators ───────────────────────────────────────────────
+RSI_PERIOD         = 14
+RSI_OVERBOUGHT     = 70   # block entry if RSI > this (already extended)
+MACD_FAST          = 12
+MACD_SLOW          = 26
+MACD_SIGNAL_PERIOD = 9
+EMA_TREND_PERIOD   = 50   # bullish bias when price is above this EMA
+VOLUME_MA_PERIOD   = 20
+VOLUME_SPIKE_MULT  = 1.5  # sweep volume must be ≥ this × rolling average
+
+# ── Fair Value Gap ───────────────────────────────────────────
+FVG_LOOKBACK = 30  # scan last N candles for bullish FVGs
+
+# ── Higher Timeframe Filter ──────────────────────────────────
+HTF_INTERVAL  = "1h"   # timeframe for macro trend bias
+HTF_FETCH_DAYS = 30    # how many days of 1H candles to fetch
+
+# ── Confluences (weighted scoring) ───────────────────────────
+# vol_spike and fvg are direct smart-money fingerprints → worth 2pts each
+# rsi, macd, ema50 are supporting indicators → worth 1pt each  (max score = 7)
+CONFLUENCE_WEIGHTS = {
+    "vol_spike": 2,
+    "fvg":       2,
+    "ema50":     1,
+    "macd":      1,
+    "rsi":       1,
+}
+MIN_CONFLUENCES = 4  # minimum weighted score required to enter (out of 7)
+
+# ── Entry Filter ─────────────────────────────────────────────
+ENTRY_SPREAD_MAX_PCT = 0.05  # skip pair if bid-ask spread exceeds this
+
+# ── Position Sizing (risk-based) ─────────────────────────────
+RISK_PER_TRADE_PCT = 0.02   # risk 2% of portfolio on each trade
+MAX_POSITION_PCT   = 0.30   # hard cap: no more than 30% per trade
+MIN_POSITION_PCT   = 0.05   # floor: at least 5% if SL is very wide
+
+# ── Stop Loss / Take Profit ──────────────────────────────────
+SL_BUFFER_PCT    = 0.002  # place SL 0.2% below the sweep wick low
+TP_MIN_PCT       = 0.008  # minimum take profit of 0.8%
+TP_MAX_PCT       = 0.04   # cap take profit at 4%
+RECONCILE_SL_PCT = 0.03   # fallback SL for reconciled positions: 3% below current price
 
 # ── Cooldown ─────────────────────────────────────────────────
-COOLDOWN_MIN_MINUTES = 5        # 5 minutes minimum after exit
-COOLDOWN_STABILITY_CHECKS = 3   # consecutive stable HMM reads needed
+COOLDOWN_MIN_MINUTES        = 10    # minimum wait after closing a position
+COOLDOWN_STABILITY_CHECKS   = 2     # kept for CooldownManager compatibility
 COOLDOWN_STABILITY_THRESHOLD = 0.65
 
 # ── Order Execution ──────────────────────────────────────────
-USE_LIMIT_ORDERS = True
-LIMIT_ORDER_OFFSET_PCT = 0.0003
-LIMIT_ORDER_TIMEOUT_SEC = 45
+USE_LIMIT_ORDERS            = True
+LIMIT_ORDER_OFFSET_PCT      = 0.0003
+LIMIT_ORDER_TIMEOUT_SEC     = 45
 LIMIT_ORDER_FALLBACK_MARKET = True
 
 # ── Polling & Rate Limits ────────────────────────────────────
-POLL_INTERVAL_SEC = 30
+POLL_INTERVAL_SEC     = 30
 MAX_API_CALLS_PER_MIN = 30
-RETRY_BASE_DELAY_SEC = 1.0
-RETRY_MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY_SEC  = 1.0
+RETRY_MAX_ATTEMPTS    = 3
 
 # ── Logging ──────────────────────────────────────────────────
-LOG_DIR = "logs"
-LOG_LEVEL = "INFO"
-LOG_TRADES_FILE = "logs/trades.jsonl"
+LOG_DIR          = "logs"
+LOG_LEVEL        = "INFO"
+LOG_TRADES_FILE  = "logs/trades.jsonl"
 LOG_SIGNALS_FILE = "logs/signals.jsonl"
-LOG_ERRORS_FILE = "logs/errors.log"
+LOG_ERRORS_FILE  = "logs/errors.log"
 
 # ── Data Paths ───────────────────────────────────────────────
 DATA_DIR = "data"
-HMM_MODEL_DIR = "models"

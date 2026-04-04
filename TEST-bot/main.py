@@ -1,11 +1,17 @@
 """
-Main trading bot loop.
+Main trading bot loop — SMC edition (v2 with all fixes applied).
 
-Ties together: data fetching, HMM training, signal generation,
-Monte Carlo position sizing, order execution, and cooldown management.
+Flow:
+  1. Initialise: fetch 5m + 1H data, compute SMC indicators, cache exchange info
+  2. Live loop (every POLL_INTERVAL_SEC):
+       a. Snapshot portfolio + tickers
+       b. For each pair: generate SMC signal (with HTF gate) → execute BUY / SELL
+       c. Refresh data every DATA_REFRESH_INTERVAL_HOURS
 
-Usage:
-    python main.py
+Fixes vs v1:
+  - Fix 3: 1H HTF data fetched and passed to signal generator
+  - Fix 4: exchange_info cached at startup, not re-fetched per trade
+  - Fix 6: reconciled positions get a fallback SL/TP from RECONCILE_SL_PCT
 """
 import os
 import sys
@@ -14,32 +20,28 @@ import json
 import logging
 import argparse
 import warnings
-import numpy as np
 from datetime import datetime
 
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore")
 
 from config import (
-    PAIRS, POLL_INTERVAL_SEC, LOG_DIR, LOG_LEVEL,
-    LOG_SIGNALS_FILE, LOG_ERRORS_FILE, HMM_RETRAIN_INTERVAL_HOURS
+    PAIRS, POLL_INTERVAL_SEC, DATA_REFRESH_INTERVAL_HOURS,
+    LOG_DIR, LOG_LEVEL, LOG_SIGNALS_FILE, LOG_ERRORS_FILE,
+    RECONCILE_SL_PCT, TP_MIN_PCT,
 )
 from data import (
-    load_or_fetch_historical, compute_features, get_hmm_observations,
-    compute_live_features
+    load_or_fetch_historical, load_or_fetch_htf, compute_smc_indicators,
 )
-from strategy import RegimeHMM, monte_carlo_position_size, SignalGenerator
-from execution import (
-    RoostooClient, OrderExecutor, CooldownManager, rate_limiter
-)
+from strategy import SMCSignalGenerator, calculate_position_size, get_trailing_sl
+from execution import RoostooClient, OrderExecutor, CooldownManager, rate_limiter
 
 
-# =============================================================
-# LOGGING SETUP
-# =============================================================
+# ═══════════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════════
 
 def setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
-
     logging.basicConfig(
         level=getattr(logging, LOG_LEVEL),
         format="%(asctime)s | %(levelname)-7s | %(name)-12s | %(message)s",
@@ -47,343 +49,363 @@ def setup_logging():
         handlers=[
             logging.StreamHandler(sys.stdout),
             logging.FileHandler(LOG_ERRORS_FILE),
-        ]
+        ],
     )
 
 
-# =============================================================
+# ═══════════════════════════════════════════════════════════════
 # POSITION TRACKER
-# =============================================================
+# ═══════════════════════════════════════════════════════════════
 
 STATE_FILE = "logs/state.json"
 
+_EMPTY_POS = lambda: {
+    "side": "none", "entry_price": 0.0,
+    "quantity": 0.0, "sl_price": 0.0, "tp_price": 0.0,
+    "entry_time": "",   # ISO timestamp — used by trailing SL to find post-entry swing lows
+}
+
 
 class PositionTracker:
-    """Track open positions per pair, persisted across restarts."""
+    """Track open positions per pair (persisted to JSON)."""
 
     def __init__(self):
-        self.positions = {}
-        for pair in PAIRS:
-            self.positions[pair] = {"side": "none", "entry_price": 0, "quantity": 0}
+        self.positions = {pair: _EMPTY_POS() for pair in PAIRS}
         self._load()
 
     def _load(self):
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE) as f:
                 saved = json.load(f)
-            self.positions.update(saved)
-            logging.getLogger("PositionTracker").info("Restored positions: %s", self.positions)
+            for pair, pos in saved.items():
+                self.positions[pair] = {**_EMPTY_POS(), **pos}
+            logging.getLogger("Positions").info("Restored: %s", self.positions)
 
     def _save(self):
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         with open(STATE_FILE, "w") as f:
             json.dump(self.positions, f, indent=2)
 
-    def reconcile_positions(self, client):
-        """On startup, verify saved positions match actual exchange balances."""
-        logger = logging.getLogger("PositionTracker")
+    def reconcile(self, client: RoostooClient):
+        """
+        On startup: align saved state with actual exchange balances.
+        Fix 6: positions found on exchange but missing from state get a
+        fallback SL (RECONCILE_SL_PCT below current price) and TP
+        (TP_MIN_PCT above current price) so the bot can always exit.
+        """
+        log     = logging.getLogger("Positions")
         balance = client.get_balance()
-        wallet = balance.get("SpotWallet", balance.get("Wallet", {}))
+        wallet  = balance.get("SpotWallet", balance.get("Wallet", {}))
 
         for pair in PAIRS:
-            coin = pair.split("/")[0]
+            coin    = pair.split("/")[0]
             holding = wallet.get(coin, {})
-            qty = holding.get("Free", 0) + holding.get("Lock", 0)
-            saved = self.positions.get(pair, {})
+            qty     = holding.get("Free", 0) + holding.get("Lock", 0)
+            saved   = self.positions.get(pair, _EMPTY_POS())
 
-            if qty > 0 and saved.get("side") != "long":
-                ticker = client.get_ticker_spread(pair)
-                entry = ticker["last"] if ticker["last"] > 0 else 0
-                self.positions[pair] = {"side": "long", "entry_price": entry, "quantity": qty}
-                logger.warning(
-                    "Reconciled %s: found qty=%.6f on exchange with no saved position. "
-                    "Entry price set to current price $%.2f", pair, qty, entry
+            if qty > 0 and saved["side"] != "long":
+                ticker   = client.get_ticker_spread(pair)
+                price    = ticker["last"] if ticker["last"] > 0 else 0.0
+                sl_price = price * (1 - RECONCILE_SL_PCT)
+                tp_price = price * (1 + TP_MIN_PCT)
+                self.positions[pair] = {
+                    "side":        "long",
+                    "entry_price": price,
+                    "quantity":    qty,
+                    "sl_price":    round(sl_price, 6),
+                    "tp_price":    round(tp_price, 6),
+                    "entry_time":  datetime.utcnow().isoformat(),
+                }
+                log.warning(
+                    "Reconciled %s: qty=%.6f at $%.4f | "
+                    "fallback SL=%.4f TP=%.4f",
+                    pair, qty, price, sl_price, tp_price,
                 )
-            elif qty == 0 and saved.get("side") == "long":
-                logger.warning(
-                    "Reconciled %s: saved position found but no coins on exchange. Clearing.", pair
+
+            elif qty == 0 and saved["side"] == "long":
+                log.warning(
+                    "Reconciled %s: state says long but no coins on exchange — clearing",
+                    pair,
                 )
-                self.positions[pair] = {"side": "none", "entry_price": 0, "quantity": 0}
+                self.positions[pair] = _EMPTY_POS()
 
         self._save()
 
-    def open_position(self, pair: str, entry_price: float, quantity: float):
+    def open_position(self, pair: str, entry_price: float, quantity: float,
+                      sl_price: float, tp_price: float, entry_time: str = ""):
         self.positions[pair] = {
-            "side": "long",
+            "side":        "long",
             "entry_price": entry_price,
-            "quantity": quantity,
+            "quantity":    quantity,
+            "sl_price":    sl_price,
+            "tp_price":    tp_price,
+            "entry_time":  entry_time,
         }
         self._save()
 
+    def update_sl(self, pair: str, new_sl: float):
+        """Move SL up to new_sl. Only saves if pair has an open long."""
+        if self.positions.get(pair, {}).get("side") == "long":
+            self.positions[pair]["sl_price"] = round(new_sl, 6)
+            self._save()
+
     def close_position(self, pair: str):
-        self.positions[pair] = {"side": "none", "entry_price": 0, "quantity": 0}
+        self.positions[pair] = _EMPTY_POS()
         self._save()
 
     def get(self, pair: str) -> dict:
-        return self.positions.get(pair, {"side": "none", "entry_price": 0, "quantity": 0})
+        return self.positions.get(pair, _EMPTY_POS())
 
 
-# =============================================================
-# MAIN BOT
-# =============================================================
+# ═══════════════════════════════════════════════════════════════
+# TRADING BOT
+# ═══════════════════════════════════════════════════════════════
 
 class TradingBot:
+
     def __init__(self):
-        self.client = RoostooClient()
-        self.executor = OrderExecutor(self.client)
-        self.cooldown = CooldownManager()
-        self.positions = PositionTracker()
-        self.signal_gen = SignalGenerator()
+        self.client     = RoostooClient()
+        self.executor   = OrderExecutor(self.client)
+        self.cooldown   = CooldownManager()
+        self.positions  = PositionTracker()
+        self.signal_gen = SMCSignalGenerator()
 
-        self.hmm_models = {}
-        self.historical_data = {}
-        self.feature_data = {}
-        self.last_train_time = {}
+        self.smc_data      = {}   # pair → 5m DataFrame with SMC indicators
+        self.htf_data      = {}   # pair → 1H DataFrame with SMC indicators (Fix 3)
+        self.last_refresh  = {}   # pair → datetime of last 5m fetch
+        self.exchange_info = {}   # Fix 4: cached once at startup
+        self.logger        = logging.getLogger("Bot")
 
-        self.logger = logging.getLogger("Bot")
+    # ── Initialisation ──────────────────────────────────────────
 
     def initialise(self):
-        """Fetch historical data and train HMMs for all pairs."""
         self.logger.info("=" * 60)
-        self.logger.info("INITIALISING TRADING BOT")
+        self.logger.info("SMC TRADING BOT v2 — INITIALISING")
         self.logger.info("Pairs: %s", PAIRS)
         self.logger.info("=" * 60)
 
-        server_time = self.client.get_server_time()
-        self.logger.info("Server time: %s", server_time)
+        self.logger.info("Server time: %s", self.client.get_server_time())
 
-        exchange_info = self.client.get_exchange_info()
-        if exchange_info:
-            available = list(exchange_info.get("TradePairs", {}).keys())
-            self.logger.info("Available pairs: %s", available)
+        # Fix 4: fetch and cache exchange info once
+        self.exchange_info = self.client.get_exchange_info()
+        if self.exchange_info:
+            available = list(self.exchange_info.get("TradePairs", {}).keys())
+            self.logger.info("Exchange pairs available: %s", available)
 
         for pair in PAIRS:
-            self.logger.info("\n--- Setting up %s ---", pair)
-
-            df = load_or_fetch_historical(pair)
-            if df.empty:
-                self.logger.error("No data for %s, skipping", pair)
-                continue
-
-            df_features = compute_features(df)
-            self.historical_data[pair] = df
-            self.feature_data[pair] = df_features
-
-            hmm = RegimeHMM()
-            observations = get_hmm_observations(df_features)
-            hmm.train(observations, pair)
-            hmm.save(pair)
-            self.hmm_models[pair] = hmm
-            self.last_train_time[pair] = datetime.utcnow()
+            self.logger.info("--- Loading data for %s ---", pair)
+            self._refresh_data(pair)
 
         balance = self.client.get_balance()
         self.logger.info("Starting balance: %s", json.dumps(balance, indent=2))
+        self.positions.reconcile(self.client)
 
-        self.positions.reconcile_positions(self.client)
-        self.logger.info("Position state after reconciliation: %s", self.positions.positions)
+    def _refresh_data(self, pair: str, force: bool = False):
+        """Fetch 5m + 1H data and recompute SMC indicators for a pair."""
+        # 5m data
+        df = load_or_fetch_historical(pair, force_refresh=force)
+        if df.empty:
+            self.logger.error("No 5m data for %s — skipping", pair)
+            return
+        self.smc_data[pair]    = compute_smc_indicators(df)
+        self.last_refresh[pair] = datetime.utcnow()
+        self.logger.info("%s: %d × 5m candles loaded", pair, len(self.smc_data[pair]))
+
+        # Fix 3: 1H HTF data
+        htf_df = load_or_fetch_htf(pair, force_refresh=force)
+        if not htf_df.empty:
+            self.htf_data[pair] = compute_smc_indicators(htf_df)
+            self.logger.info("%s: %d × 1H candles loaded (HTF)", pair, len(self.htf_data[pair]))
+        else:
+            self.logger.warning("%s: no 1H data — HTF gate disabled for this pair", pair)
+
+    # ── Main loop ───────────────────────────────────────────────
 
     def run(self):
-        """Main trading loop."""
         self.initialise()
         self.logger.info("\n" + "=" * 60)
-        self.logger.info("STARTING LIVE TRADING LOOP")
-        self.logger.info("Poll interval: %ss", POLL_INTERVAL_SEC)
+        self.logger.info("LIVE TRADING — poll every %ds", POLL_INTERVAL_SEC)
         self.logger.info("=" * 60)
 
         cycle = 0
         while True:
             cycle += 1
             try:
-                self.logger.info("\n%s Cycle %d %s", "-"*40, cycle, "-"*40)
+                self.logger.info("\n%s Cycle %d %s", "-" * 40, cycle, "-" * 40)
                 self._trading_cycle()
-
             except KeyboardInterrupt:
-                self.logger.info("Shutdown requested. Exiting...")
+                self.logger.info("Shutdown requested. Exiting.")
                 break
             except Exception as e:
-                self.logger.error("Error in cycle %d: %s", cycle, e, exc_info=True)
+                self.logger.error("Cycle %d error: %s", cycle, e, exc_info=True)
 
-            self._check_retrain()
+            self._maybe_refresh_data()
 
             self.logger.info(
-                "Rate limiter: %d calls remaining. Sleeping %ds...",
-                rate_limiter.remaining_calls, POLL_INTERVAL_SEC
+                "Rate limit: %d calls remaining. Sleeping %ds…",
+                rate_limiter.remaining_calls, POLL_INTERVAL_SEC,
             )
             time.sleep(POLL_INTERVAL_SEC)
 
+    # ── Single trading cycle ─────────────────────────────────────
+
     def _trading_cycle(self):
-        """Single iteration: check signals for each pair and act."""
         balance = self.client.get_balance()
-        wallet = balance.get("SpotWallet", balance.get("Wallet", {}))
+        wallet  = balance.get("SpotWallet", balance.get("Wallet", {}))
+        tickers = {pair: self.client.get_ticker_spread(pair) for pair in PAIRS}
 
-        # Pre-fetch all tickers once and reuse throughout the cycle
-        ticker_cache = {pair: self.client.get_ticker_spread(pair) for pair in PAIRS}
-
+        # Portfolio snapshot
         self.logger.info("--- Portfolio Snapshot ---")
         usd = wallet.get("USD", {})
-        self.logger.info("  USD   | Free: $%-12s | Lock: $%s",
-                         f"{usd.get('Free', 0):,.2f}", f"{usd.get('Lock', 0):,.2f}")
-
+        self.logger.info(
+            "  USD   | Free: $%-12s | Lock: $%s",
+            f"{usd.get('Free', 0):,.2f}", f"{usd.get('Lock', 0):,.2f}",
+        )
         for coin, amounts in wallet.items():
             if coin == "USD":
                 continue
             pair = f"{coin}/USD"
-            pos = self.positions.get(pair)
-
-            pnl_str = "N/A"
-            if pos['side'] == "long" and pos['entry_price'] > 0:
-                ticker = ticker_cache.get(pair) or self.client.get_ticker_spread(pair)
-                if ticker["last"] > 0:
-                    current_price = ticker["last"]
-                    pnl_pct = (current_price - pos['entry_price']) / pos['entry_price'] * 100
-                    pnl_usd = (current_price - pos['entry_price']) * pos['quantity']
-                    pnl_str = f"{pnl_pct:+.2f}% (${pnl_usd:+,.2f})"
-
+            pos  = self.positions.get(pair)
+            pnl  = "N/A"
+            if pos["side"] == "long" and pos["entry_price"] > 0:
+                t = tickers.get(pair)
+                if t and t["last"] > 0:
+                    pct     = (t["last"] - pos["entry_price"]) / pos["entry_price"] * 100
+                    usd_pnl = (t["last"] - pos["entry_price"]) * pos["quantity"]
+                    pnl     = f"{pct:+.2f}% (${usd_pnl:+,.2f})"
             self.logger.info(
-                "  %-5s | Free: %-12s | Lock: %-12s | Side: %-5s | Entry: $%-12s | Qty: %-14s | PnL: %s",
+                "  %-5s | Free: %-12.6f | Lock: %-12.6f | Side: %-5s | "
+                "Entry: $%-12.4f | SL: $%-10.4f | TP: $%-10.4f | PnL: %s",
                 coin,
-                f"{amounts.get('Free', 0):.6f}",
-                f"{amounts.get('Lock', 0):.6f}",
-                pos['side'],
-                f"{pos['entry_price']:,.2f}",
-                f"{pos['quantity']:.6f}",
-                pnl_str
+                amounts.get("Free", 0), amounts.get("Lock", 0),
+                pos["side"], pos["entry_price"],
+                pos["sl_price"], pos["tp_price"], pnl,
             )
-        self.logger.info("-" * 26)
 
-        # Calculate portfolio value from already-fetched wallet + ticker cache
         portfolio_value = usd.get("Free", 0) + usd.get("Lock", 0)
         for coin, amounts in wallet.items():
             if coin == "USD":
                 continue
-            holding = amounts.get("Free", 0) + amounts.get("Lock", 0)
-            if holding > 0:
-                t = ticker_cache.get(f"{coin}/USD") or self.client.get_ticker_spread(f"{coin}/USD")
+            qty = amounts.get("Free", 0) + amounts.get("Lock", 0)
+            if qty > 0:
+                t = tickers.get(f"{coin}/USD") or self.client.get_ticker_spread(f"{coin}/USD")
                 if t and t["last"] > 0:
-                    portfolio_value += holding * t["last"]
+                    portfolio_value += qty * t["last"]
         self.logger.info("Portfolio value: $%s", f"{portfolio_value:,.2f}")
 
+        # Per-pair signal loop
         for pair in PAIRS:
-            if pair not in self.hmm_models:
+            if pair not in self.smc_data:
                 continue
 
             self.logger.info("\n  -- %s --", pair)
+            ticker = tickers[pair]
 
-            ticker = ticker_cache[pair]
             if ticker["spread_pct"] >= 999:
                 self.logger.warning("  Ticker unavailable for %s, skipping", pair)
                 continue
 
             self.logger.info(
                 "  Price: $%s | Bid: $%s | Ask: $%s | Spread: %s%%",
-                f"{ticker['last']:,.2f}", f"{ticker['bid']:,.2f}",
-                f"{ticker['ask']:,.2f}", f"{ticker['spread_pct']:.4f}"
+                f"{ticker['last']:,.4f}", f"{ticker['bid']:,.4f}",
+                f"{ticker['ask']:,.4f}", f"{ticker['spread_pct']:.4f}",
             )
 
-            features = compute_live_features(
-                self.feature_data[pair],
-                ticker["last"],
-                ticker["volume"]
-            )
-
-            hmm = self.hmm_models[pair]
-            obs_row = np.array([[
-                features["log_return"],
-                features["rolling_vol"],
-                features["momentum"],
-                features["volume_zscore"]
-            ]])
-            recent_obs = get_hmm_observations(self.feature_data[pair])
-            full_obs = np.vstack([recent_obs[-287:], obs_row])
-            regime_probs = hmm.get_regime_probabilities(full_obs)
-
-            self.logger.info(
-                "  Regime: Bull=%s | Bear=%s | Neutral=%s",
-                f"{regime_probs['bullish']:.3f}",
-                f"{regime_probs['bearish']:.3f}",
-                f"{regime_probs['neutral']:.3f}"
-            )
-
-            if self.cooldown.is_on_cooldown(pair, regime_probs):
-                self.logger.info("  %s on cooldown, skipping", pair)
+            if self.cooldown.is_on_cooldown(pair):
+                self.logger.info("  %s on cooldown — skipping", pair)
                 continue
 
             position = self.positions.get(pair)
+            df       = self.smc_data[pair]
+            htf_df   = self.htf_data.get(pair)   # Fix 3: pass HTF to signal gen
+
             signal = self.signal_gen.generate_signal(
-                regime_probs, features, ticker["spread_pct"], position
+                df, ticker["last"], ticker["spread_pct"], position, htf_df=htf_df
             )
 
             self.logger.info("  Signal: %s", signal["action"])
-            for reason in signal["reasons"]:
-                self.logger.info("    %s", reason)
+            for r in signal["reasons"]:
+                self.logger.info("    %s", r)
+
+            # ── Trailing SL (runs every cycle while holding, before exit check) ──
+            if position["side"] == "long" and position.get("entry_time"):
+                new_sl = get_trailing_sl(
+                    df,
+                    entry_time=position["entry_time"],
+                    current_sl=position["sl_price"],
+                )
+                if new_sl > position["sl_price"]:
+                    self.logger.info(
+                        "  Trailing SL: %.6f → %.6f (+%.4f%%)",
+                        position["sl_price"], new_sl,
+                        (new_sl - position["sl_price"]) / position["sl_price"] * 100,
+                    )
+                    self.positions.update_sl(pair, new_sl)
+                    position = self.positions.get(pair)   # refresh for exit check below
 
             if signal["action"] == "BUY":
-                self._execute_buy(pair, ticker, regime_probs, portfolio_value, hmm)
+                self._execute_buy(pair, ticker, portfolio_value, signal)
             elif signal["action"] == "SELL":
                 self._execute_sell(pair, ticker, signal)
 
-            self._log_signal(pair, signal, regime_probs, features, ticker)
+            self._log_signal(pair, signal, ticker, position)
 
-    def _execute_buy(self, pair, ticker, regime_probs, portfolio_value, hmm):
-        """Run Monte Carlo, size position, execute buy."""
-        regime_params = hmm.get_regime_params()
-        current_regime = hmm.bull_idx
+    # ── Buy ──────────────────────────────────────────────────────
 
-        mc_result = monte_carlo_position_size(
-            regime_params, current_regime, portfolio_value
-        )
+    def _execute_buy(self, pair: str, ticker: dict,
+                     portfolio_value: float, signal: dict):
+        entry_price = ticker["ask"]
+        sl_price    = signal["sl_price"]
+        tp_price    = signal["tp_price"]
 
-        if mc_result["position_pct"] <= 0:
-            self.logger.info("  MC says don't trade (position=0%%)")
+        sizing       = calculate_position_size(portfolio_value, entry_price, sl_price)
+        position_usd = sizing["position_usd"]
+
+        if position_usd < 1.0:
+            self.logger.info("  Position too small ($%.2f) — skipping", position_usd)
             return
 
-        position_usd = mc_result["position_usd"]
-        price = ticker["ask"]
+        quantity = position_usd / entry_price
 
-        quantity = position_usd / price
-
-        exchange_info = self.client.get_exchange_info()
-        pair_info = exchange_info.get("TradePairs", {}).get(pair, {})
-        self.logger.info("  Exchange pair_info for %s: %s", pair, pair_info)
-
+        # Fix 4: use cached exchange_info, no extra API call
+        pair_info = self.exchange_info.get("TradePairs", {}).get(pair, {})
         precision = pair_info.get("AmountPrecision", 6)
-        step = pair_info.get("AmountStep", None)
+        step      = pair_info.get("AmountStep", None)
 
         if step and step > 0:
             quantity = int(quantity / step) * step
             quantity = round(quantity, precision)
         else:
-            factor = 10 ** precision
+            factor   = 10 ** precision
             quantity = int(quantity * factor) / factor
 
-        if quantity * price < 1.0:
-            self.logger.info("  Order too small: $%s < $1.00", f"{quantity * price:.2f}")
+        if quantity * entry_price < 1.0:
+            self.logger.info("  Order too small after rounding — skipping")
             return
 
         self.logger.info(
-            "  BUYING %s: qty=%s (~$%s, %s%% of portfolio)",
-            pair, quantity, f"{position_usd:,.0f}",
-            f"{mc_result['position_pct']*100:.1f}"
-        )
-        self.logger.info(
-            "  MC: %s%% paths positive, tail risk=%s%%",
-            f"{mc_result['paths_positive_pct']*100:.1f}",
-            f"{mc_result['tail_risk_5pct']*100:.3f}"
+            "  BUYING %s: qty=%.6f | ~$%.2f (%.1f%% of portfolio) | "
+            "SL=%.4f | TP=%.4f | Risk=%.2f%% | SL-dist=%.4f%%",
+            pair, quantity, position_usd,
+            sizing["position_pct"] * 100,
+            sl_price, tp_price,
+            sizing["risk_amount"] / portfolio_value * 100,
+            sizing["sl_distance_pct"],
         )
 
         result = self.executor.execute_buy(pair, quantity, ticker)
 
         if result.get("Success"):
-            filled_price = result.get("OrderDetail", {}).get("FilledAverPrice", price)
-            if filled_price == 0:
-                filled_price = price
-            self.positions.open_position(pair, filled_price, quantity)
-            self.logger.info("  BUY filled at $%s", f"{filled_price:,.2f}")
+            filled     = result.get("OrderDetail", {}).get("FilledAverPrice", entry_price) or entry_price
+            entry_time = datetime.utcnow().isoformat()
+            self.positions.open_position(pair, float(filled), quantity, sl_price, tp_price, entry_time)
+            self.logger.info("  BUY filled at $%.4f | entry_time=%s", filled, entry_time)
         else:
             self.logger.error("  BUY failed: %s", result.get("ErrMsg", "unknown"))
 
-    def _execute_sell(self, pair, ticker, signal):
-        """Execute sell and start cooldown."""
+    # ── Sell ─────────────────────────────────────────────────────
+
+    def _execute_sell(self, pair: str, ticker: dict, signal: dict):
         position = self.positions.get(pair)
         quantity = position.get("quantity", 0)
 
@@ -392,91 +414,72 @@ class TradingBot:
             return
 
         self.logger.info(
-            "  SELLING %s: qty=%s | Reason: %s",
+            "  SELLING %s: qty=%.6f | %s",
             pair, quantity,
-            signal["reasons"][0] if signal["reasons"] else "unknown"
+            signal["reasons"][0] if signal["reasons"] else "signal",
         )
 
         result = self.executor.execute_sell(pair, quantity, ticker)
 
         if result.get("Success"):
-            filled_price = result.get("OrderDetail", {}).get("FilledAverPrice", ticker["bid"])
-            entry_price = position.get("entry_price", 0)
-            pnl_pct = ((filled_price - entry_price) / entry_price * 100) if entry_price else 0
-
+            filled  = result.get("OrderDetail", {}).get("FilledAverPrice", ticker["bid"]) or ticker["bid"]
+            entry   = position.get("entry_price", 0)
+            pnl_pct = ((filled - entry) / entry * 100) if entry else 0
             self.positions.close_position(pair)
             self.cooldown.start_cooldown(pair)
-
-            self.logger.info(
-                "  SELL filled at $%s | PnL: %s%%",
-                f"{filled_price:,.2f}", f"{pnl_pct:+.2f}"
-            )
+            self.logger.info("  SELL filled at $%.4f | PnL: %+.2f%%", filled, pnl_pct)
         else:
             self.logger.error("  SELL failed: %s", result.get("ErrMsg", "unknown"))
 
-    def _check_retrain(self):
-        """Retrain HMM if enough time has passed."""
+    # ── Data refresh ─────────────────────────────────────────────
+
+    def _maybe_refresh_data(self):
         for pair in PAIRS:
-            if pair not in self.last_train_time:
+            if pair not in self.last_refresh:
                 continue
-            hours_since = (datetime.utcnow() - self.last_train_time[pair]).total_seconds() / 3600
-            if hours_since >= HMM_RETRAIN_INTERVAL_HOURS:
-                self.logger.info("Retraining HMM for %s (%.1fh since last)", pair, hours_since)
+            hours_since = (datetime.utcnow() - self.last_refresh[pair]).total_seconds() / 3600
+            if hours_since >= DATA_REFRESH_INTERVAL_HOURS:
+                self.logger.info(
+                    "Refreshing data for %s (%.1fh since last fetch)", pair, hours_since
+                )
                 try:
-                    df = load_or_fetch_historical(pair, force_refresh=True)
-                    df_features = compute_features(df)
-                    self.historical_data[pair] = df
-                    self.feature_data[pair] = df_features
-
-                    obs = get_hmm_observations(df_features)
-                    self.hmm_models[pair].train(obs, pair)
-                    self.hmm_models[pair].save(pair)
-                    self.last_train_time[pair] = datetime.utcnow()
+                    self._refresh_data(pair, force=True)
                 except Exception as e:
-                    self.logger.error("Retrain failed for %s: %s", pair, e)
+                    self.logger.error("Data refresh failed for %s: %s", pair, e)
 
-    def _log_signal(self, pair, signal, regime_probs, features, ticker):
-        """Log signal details to JSONL file."""
+    # ── Signal logger ────────────────────────────────────────────
+
+    def _log_signal(self, pair: str, signal: dict, ticker: dict, position: dict):
         os.makedirs(LOG_DIR, exist_ok=True)
         entry = {
-            "timestamp": datetime.utcnow().isoformat(),
-            "pair": pair,
-            "action": signal["action"],
-            "confidence": signal["confidence"],
-            "reasons": signal["reasons"],
-            "regime": regime_probs,
-            "features": {k: round(v, 6) if isinstance(v, float) else v
-                         for k, v in features.items()},
+            "timestamp":  datetime.utcnow().isoformat(),
+            "pair":       pair,
+            "action":     signal["action"],
+            "reasons":    signal["reasons"],
+            "sl_price":   signal.get("sl_price"),
+            "tp_price":   signal.get("tp_price"),
+            "conf_score": signal.get("conf_score"),
             "ticker": {
-                "last": ticker["last"],
-                "bid": ticker["bid"],
-                "ask": ticker["ask"],
+                "last":       ticker["last"],
+                "bid":        ticker["bid"],
+                "ask":        ticker["ask"],
                 "spread_pct": ticker["spread_pct"],
             },
-            "position": self.positions.get(pair),
+            "position": position,
         }
         with open(LOG_SIGNALS_FILE, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
 
-# =============================================================
+# ═══════════════════════════════════════════════════════════════
 # ENTRYPOINT
-# =============================================================
+# ═══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="HMM + Monte Carlo Crypto Trading Bot")
-    parser.add_argument("--backtest", action="store_true", help="Run backtest mode")
-    args = parser.parse_args()
-
+    parser = argparse.ArgumentParser(description="SMC Crypto Trading Bot v2")
+    parser.parse_args()
     setup_logging()
-    logger = logging.getLogger("Main")
-
-    if args.backtest:
-        logger.info("Backtest mode not yet implemented. Use live mode.")
-        sys.exit(0)
-
-    bot = TradingBot()
-    bot.run()
+    TradingBot().run()
 
 
 if __name__ == "__main__":
