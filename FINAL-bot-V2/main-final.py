@@ -2,8 +2,8 @@
 Main trading bot loop — SMC FINAL bot V2.
 
 Loads all modules from bot_internal/ using importlib so that
-hyphenated/dotted filenames (config-final.py, data.final.py,
-execution-final.py) work correctly with standard Python imports.
+hyphenated filenames (config-final.py, data-final.py,
+execution-final.py, strategy-final.py) work correctly with standard Python imports.
 """
 import os
 import sys
