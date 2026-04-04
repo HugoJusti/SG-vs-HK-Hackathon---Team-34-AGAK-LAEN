@@ -19,6 +19,7 @@ from data import load_or_fetch_historical, load_or_fetch_htf, compute_smc_indica
 from strategy import (
     SMCSignalGenerator,
     detect_swing_lows, build_support_zones,
+    get_recent_support_zone,
     detect_liquidity_sweep, detect_bos,
     build_market_structure,
 )
@@ -61,14 +62,19 @@ def debug_pair(pair: str):
     else:
         print("\n  [Gate 1] HTF bias: no 1H data — gate SKIPPED")
 
-    # Support zones
-    swing_lows = detect_swing_lows(df5)
-    zones      = build_support_zones(swing_lows)
-    print(f"\n  [Gate 2] Swing lows found: {len(swing_lows)}  →  {len(zones)} zone(s)")
-    for z in zones[:5]:
-        print(f"           zone {z['low']:.6f}–{z['high']:.6f}  strength={z['strength']}")
-    if not zones:
-        print("           FAIL — no zones")
+    # Support zone (most recent structural low candle range)
+    atr_val = float(df5["atr"].iloc[-1]) if "atr" in df5.columns else 0
+    zone = get_recent_support_zone(df5)
+    if zone:
+        above    = current_price > zone["high"]
+        dist_atr = (current_price - zone["high"]) / atr_val if atr_val > 0 else 0
+        status   = "PASS" if above and dist_atr <= 1.5 else ("too far (>1.5x ATR)" if above else "below/inside zone")
+        print(f"\n  [Gate 2] Recent support zone [{zone['label']}] sig={zone['significance']:.2f}")
+        print(f"           zone:  {zone['low']:.6f} - {zone['high']:.6f}")
+        print(f"           price: {current_price:.6f}  ({'above' if above else 'below/inside'}, {dist_atr:.2f}x ATR from ceiling)")
+        print(f"           -> {status}")
+    else:
+        print(f"\n  [Gate 2] FAIL -- no structural swing low found")
 
     # Liquidity sweep
     sweep = detect_liquidity_sweep(df5, zones)
