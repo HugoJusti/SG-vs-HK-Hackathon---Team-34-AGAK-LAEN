@@ -25,7 +25,7 @@ from config import (
     SWING_LEFT_BARS, SWING_RIGHT_BARS, SWING_LOOKBACK, SWING_SIGNIFICANCE_ATR_MULT,
     ZONE_MARGIN_PCT,
     SWEEP_TOLERANCE_PCT, SWEEP_LOOKBACK, SWEEP_WICK_RATIO_MIN,
-    BOS_LOOKBACK, BOS_LIVE_BUFFER,
+    BOS_LOOKBACK,
     RSI_OVERBOUGHT,
     FVG_LOOKBACK, MIN_CONFLUENCES, CONFLUENCE_WEIGHTS,
     ENTRY_SPREAD_MAX_PCT,
@@ -332,16 +332,26 @@ def detect_liquidity_sweep(df: pd.DataFrame, zones: list) -> dict:
 # BREAK OF STRUCTURE
 # ═══════════════════════════════════════════════════════════════
 
-def detect_bos(df: pd.DataFrame, sweep_candle_idx: int,
-               current_price: float = None) -> dict:
+def detect_bos(df: pd.DataFrame, sweep_candle_idx: int = None) -> dict:
     """
-    BOS: a candle closes above the most recent confirmed swing high
-    in the BOS_LOOKBACK candles before the sweep.
+    BOS: a candle closes above the most recent confirmed swing high.
+
+    sweep_candle_idx (optional):
+      When a sweep was detected, anchor the swing-high search to the
+      BOS_LOOKBACK candles before that sweep candle.
+      When None (no sweep), search the last BOS_LOOKBACK candles of df.
 
     Live price check requires BOS_LIVE_BUFFER above the level to avoid wick entries.
     """
-    pre_start = max(0, sweep_candle_idx - BOS_LOOKBACK)
-    pre_df    = df.iloc[pre_start: sweep_candle_idx + 1]
+    if sweep_candle_idx is not None:
+        pre_start = max(0, sweep_candle_idx - BOS_LOOKBACK)
+        pre_df    = df.iloc[pre_start: sweep_candle_idx + 1]
+        post_df   = df.iloc[sweep_candle_idx + 1:]
+    else:
+        # Standalone mode: find swing high in last BOS_LOOKBACK bars,
+        # then check if any of the last 5 closed candles broke it.
+        pre_df  = df.iloc[-BOS_LOOKBACK:] if len(df) >= BOS_LOOKBACK else df
+        post_df = df.iloc[-5:]
 
     if pre_df.empty:
         return {"bos": False}
@@ -350,26 +360,16 @@ def detect_bos(df: pd.DataFrame, sweep_candle_idx: int,
     if bos_level is None:
         bos_level = float(pre_df["close"].max())
 
-    post_df = df.iloc[sweep_candle_idx + 1:]
     for i, row in enumerate(post_df.itertuples()):
         if row.close > bos_level:
             return {
                 "bos":            True,
                 "bos_level":      round(bos_level, 6),
-                "bos_candle_idx": sweep_candle_idx + 1 + i,
+                "bos_candle_idx": (sweep_candle_idx + 1 + i) if sweep_candle_idx is not None else len(df) - 5 + i,
                 "bos_close":      round(float(row.close), 6),
             }
 
-    if current_price is not None and \
-       current_price > bos_level * (1 + BOS_LIVE_BUFFER):
-        return {
-            "bos":            True,
-            "bos_level":      round(bos_level, 6),
-            "bos_candle_idx": len(df),
-            "bos_close":      round(current_price, 6),
-            "live":           True,
-        }
-
+    # No live price entry — only confirmed candle closes count
     return {"bos": False, "bos_level": round(bos_level, 6)}
 
 
@@ -378,21 +378,39 @@ def detect_bos(df: pd.DataFrame, sweep_candle_idx: int,
 # ═══════════════════════════════════════════════════════════════
 
 def _detect_fvg(df: pd.DataFrame) -> list:
-    """Bullish FVG: candle[i-2].high < candle[i].low."""
-    recent = df.iloc[-FVG_LOOKBACK:] if len(df) >= FVG_LOOKBACK else df
-    highs  = recent["high"].values
-    lows   = recent["low"].values
-    fvgs   = []
+    """
+    Bullish FVG: candle[i-2].high < candle[i].low.
+    Only counted if the gap midpoint is within 2×ATR of the current close —
+    a distant FVG from hours ago at a different price level is not confluent.
+    """
+    recent        = df.iloc[-FVG_LOOKBACK:] if len(df) >= FVG_LOOKBACK else df
+    highs         = recent["high"].values
+    lows          = recent["low"].values
+    current_close = float(df["close"].iloc[-1])
+    atr_val       = float(df["atr"].iloc[-1]) if "atr" in df.columns and df["atr"].iloc[-1] > 0 else 0
+    proximity     = 2.0 * atr_val if atr_val > 0 else current_close * 0.02
+
+    fvgs = []
     for i in range(2, len(recent)):
         if highs[i - 2] < lows[i]:
-            fvgs.append({"bottom": float(highs[i - 2]), "top": float(lows[i])})
+            bottom = float(highs[i - 2])
+            top    = float(lows[i])
+            mid    = (bottom + top) / 2
+            if abs(mid - current_close) <= proximity:
+                fvgs.append({"bottom": bottom, "top": top})
     return fvgs
 
 
 def compute_confluences(df: pd.DataFrame, sweep_info: dict) -> tuple:
     """
-    Weighted confluence scoring (max = 7, threshold = MIN_CONFLUENCES = 4).
-      vol_spike=2, fvg=2, ema50=1, macd=1, rsi=1
+    Weighted confluence scoring (max = 9, threshold = MIN_CONFLUENCES = 4).
+      sweep (detected):  +2  — smart money stop-hunt fingerprint
+      vol_spike on sweep:+1  — institutional volume confirmation
+      fvg:               +2  — price inefficiency near entry
+      ema50:             +1  — 5m trend filter
+      macd:              +1  — momentum filter
+      rsi:               +1  — not overbought
+    Sweep is now scored, not a hard gate. No sweep = -3 pts but entry still possible.
     Returns (score: int, reasons: list[str]).
     """
     reasons = []
@@ -400,6 +418,22 @@ def compute_confluences(df: pd.DataFrame, sweep_info: dict) -> tuple:
     last    = df.iloc[-1]
     w       = CONFLUENCE_WEIGHTS
 
+    # ── Sweep (optional bonus) ────────────────────────────────────
+    if sweep_info.get("swept"):
+        score += w["vol_spike"]   # reuse vol_spike weight (2) for sweep presence
+        reasons.append(
+            f"[PASS +{w['vol_spike']}] LQ sweep detected "
+            f"(low={sweep_info['sweep_low']:.4f}, wick={sweep_info['wick_ratio']:.2f})"
+        )
+        if sweep_info.get("vol_spike"):
+            score += 1
+            reasons.append(f"[PASS +1] Volume spike on sweep candle")
+        else:
+            reasons.append(f"[    + 0] No volume spike on sweep candle")
+    else:
+        reasons.append(f"[    + 0] No liquidity sweep — entry on BOS alone (weaker)")
+
+    # ── RSI ───────────────────────────────────────────────────────
     if "rsi" in df.columns:
         rsi_val = float(last["rsi"])
         if rsi_val < RSI_OVERBOUGHT:
@@ -408,6 +442,7 @@ def compute_confluences(df: pd.DataFrame, sweep_info: dict) -> tuple:
         else:
             reasons.append(f"[FAIL  0] RSI={rsi_val:.1f} >= {RSI_OVERBOUGHT} (overbought)")
 
+    # ── MACD ──────────────────────────────────────────────────────
     if "macd" in df.columns and "macd_signal" in df.columns:
         if last["macd"] > last["macd_signal"]:
             score += w["macd"]
@@ -415,6 +450,7 @@ def compute_confluences(df: pd.DataFrame, sweep_info: dict) -> tuple:
         else:
             reasons.append(f"[FAIL  0] MACD bearish")
 
+    # ── EMA50 ─────────────────────────────────────────────────────
     if "ema50" in df.columns:
         if last["close"] > last["ema50"]:
             score += w["ema50"]
@@ -422,18 +458,13 @@ def compute_confluences(df: pd.DataFrame, sweep_info: dict) -> tuple:
         else:
             reasons.append(f"[FAIL  0] Price {last['close']:.4f} <= EMA50 {last['ema50']:.4f}")
 
+    # ── FVG ───────────────────────────────────────────────────────
     fvgs = _detect_fvg(df)
     if fvgs:
         score += w["fvg"]
-        reasons.append(f"[PASS +{w['fvg']}] {len(fvgs)} FVG(s) in last {FVG_LOOKBACK} candles")
+        reasons.append(f"[PASS +{w['fvg']}] {len(fvgs)} FVG(s) near price in last {FVG_LOOKBACK} candles")
     else:
-        reasons.append(f"[FAIL  0] No FVG in last {FVG_LOOKBACK} candles")
-
-    if sweep_info.get("vol_spike"):
-        score += w["vol_spike"]
-        reasons.append(f"[PASS +{w['vol_spike']}] Volume spike on sweep candle")
-    else:
-        reasons.append(f"[FAIL  0] No volume spike on sweep candle")
+        reasons.append(f"[FAIL  0] No nearby FVG in last {FVG_LOOKBACK} candles")
 
     return score, reasons
 
@@ -512,9 +543,18 @@ class SMCSignalGenerator:
                     "tp_price": tp,
                 }
 
+            unrealised_pct  = (current_price - entry) / entry * 100
+            unrealised_usd  = (current_price - entry) * current_position.get("quantity", 0)
+            sl_dist_pct     = (current_price - sl) / current_price * 100 if sl > 0 else 0
+            tp_dist_pct     = (tp - current_price) / current_price * 100 if tp > 0 else 0
             return {
                 "action":   "HOLD",
-                "reasons":  [f"Holding | SL={sl:.4f} | TP={tp:.4f} | Now={current_price:.4f}"],
+                "reasons":  [
+                    f"Holding long | entry={entry:.4f} | now={current_price:.4f}",
+                    f"  PnL:  {unrealised_pct:+.2f}%  (${unrealised_usd:+.2f})",
+                    f"  SL:   {sl:.4f}  ({sl_dist_pct:.2f}% below price)",
+                    f"  TP:   {tp:.4f}  ({tp_dist_pct:.2f}% above price)",
+                ],
                 "sl_price": sl,
                 "tp_price": tp,
             }
@@ -525,80 +565,101 @@ class SMCSignalGenerator:
         if spread_pct > ENTRY_SPREAD_MAX_PCT:
             return {
                 "action":  "HOLD",
-                "reasons": [f"[FAIL] Spread {spread_pct:.4f}% > {ENTRY_SPREAD_MAX_PCT}%"],
+                "reasons": [
+                    f"[FAIL G0] Spread too wide: {spread_pct:.4f}% > max {ENTRY_SPREAD_MAX_PCT}%",
+                    f"  ->skipping pair until spread narrows",
+                ],
             }
 
         # Gate 1 — HTF bias
         if htf_df is not None and not htf_df.empty:
             htf_last = htf_df.iloc[-1]
             if "ema50" in htf_df.columns and htf_last["close"] <= htf_last["ema50"]:
+                gap_pct = (htf_last["ema50"] - htf_last["close"]) / htf_last["ema50"] * 100
                 return {
                     "action":  "HOLD",
                     "reasons": [
-                        f"[FAIL] HTF bearish: 1H close {htf_last['close']:.4f} "
-                        f"<= 1H EMA50 {htf_last['ema50']:.4f}"
+                        f"[FAIL G1] HTF bearish: 1H close {htf_last['close']:.4f} "
+                        f"<= 1H EMA50 {htf_last['ema50']:.4f}  ({gap_pct:.2f}% below)",
+                        f"  ->all 5m setups blocked until 1H closes above EMA50",
                     ],
                 }
             reasons.append(
-                f"[PASS] HTF bullish: 1H close {htf_last['close']:.4f} "
+                f"[PASS G1] HTF bullish: 1H close {htf_last['close']:.4f} "
                 f"> 1H EMA50 {htf_last['ema50']:.4f}"
             )
 
-        # Gate 2 — Support zones
+        # Gate 2 — Support zone within proximity of current price
         swing_lows = detect_swing_lows(df)
         zones      = build_support_zones(swing_lows)
-        if not zones:
-            return {"action": "HOLD", "reasons": reasons + ["[FAIL] No support zones found"]}
-
-        reasons.append(
-            f"[PASS] {len(zones)} zone(s) | "
-            f"strongest: {zones[0]['low']:.4f}–{zones[0]['high']:.4f} "
-            f"(strength={zones[0]['strength']})"
-        )
-
-        # Gate 3 — Liquidity sweep
-        sweep = detect_liquidity_sweep(df, zones)
-        if not sweep["swept"]:
-            return {
-                "action":  "HOLD",
-                "reasons": reasons + ["[FAIL] No liquidity sweep in recent candles"],
-            }
-
-        reasons.append(
-            f"[PASS] LQ Sweep {sweep['sweep_low']:.4f} | "
-            f"zone={sweep['zone']['low']:.4f}–{sweep['zone']['high']:.4f} | "
-            f"wick={sweep['wick_ratio']:.2f}"
-        )
-
-        # Gate 4 — Break of Structure
-        bos = detect_bos(df, sweep["candle_idx"], current_price)
-        if not bos["bos"]:
+        # Only zones within 5% of current price are relevant demand areas
+        nearby_zones = [z for z in zones if abs(z["mid"] - current_price) / current_price <= 0.05]
+        if not nearby_zones:
+            all_zone_info = (f"{len(zones)} zone(s) found but all >5% away from price"
+                             if zones else "no zones found at all")
             return {
                 "action":  "HOLD",
                 "reasons": reasons + [
-                    f"[FAIL] Awaiting BOS above {bos.get('bos_level', '?'):.4f}"
+                    f"[FAIL G2] No support zone within 5% of current price — {all_zone_info}",
+                    f"  ->price not near a demand area, no setup context",
                 ],
             }
 
-        live_tag = " (live +buffer)" if bos.get("live") else ""
+        nearest = min(nearby_zones, key=lambda z: abs(z["mid"] - current_price))
         reasons.append(
-            f"[PASS] BOS{live_tag}: {bos['bos_close']:.4f} > {bos['bos_level']:.4f}"
+            f"[PASS G2] {len(nearby_zones)} nearby zone(s) | "
+            f"nearest: {nearest['low']:.4f}-{nearest['high']:.4f} "
+            f"(strength={nearest['strength']}, "
+            f"{abs(nearest['mid'] - current_price) / current_price * 100:.2f}% from price)"
         )
 
-        # Gate 5 — Weighted confluences
+        # Gate 3 — Break of Structure (hard gate, sweep optional)
+        # Try sweep-anchored BOS first; fall back to standalone BOS
+        sweep = detect_liquidity_sweep(df, nearby_zones)
+        if sweep["swept"]:
+            bos = detect_bos(df, sweep["candle_idx"])
+        else:
+            sweep = {"swept": False}
+            bos   = detect_bos(df, sweep_candle_idx=None)
+
+        if not bos["bos"]:
+            bos_level  = bos.get("bos_level", 0)
+            gap_to_bos = (bos_level - current_price) / current_price * 100 if bos_level > current_price else 0
+            return {
+                "action":  "HOLD",
+                "reasons": reasons + [
+                    f"[FAIL G3] Awaiting BOS above {bos_level:.4f}  "
+                    f"(price {current_price:.4f} is {gap_to_bos:.2f}% below)",
+                    f"  ->need a candle close above that level (or live +0.1% buffer)",
+                ],
+            }
+
+        sweep_tag = " + sweep" if sweep["swept"] else " (no sweep)"
+        live_tag  = " live" if bos.get("live") else ""
+        reasons.append(
+            f"[PASS G3] BOS{sweep_tag}{live_tag}: "
+            f"close {bos['bos_close']:.4f} > level {bos['bos_level']:.4f}"
+        )
+
+        # Gate 4 — Weighted confluences (sweep adds bonus points, not required)
         conf_score, conf_reasons = compute_confluences(df, sweep)
         reasons.extend(conf_reasons)
         if conf_score < MIN_CONFLUENCES:
             return {
                 "action":  "HOLD",
                 "reasons": reasons + [
-                    f"[FAIL] Confluence {conf_score}/{MIN_CONFLUENCES}"
+                    f"[FAIL G4] Confluence score {conf_score}/{MIN_CONFLUENCES} — need ≥{MIN_CONFLUENCES} pts",
+                    f"  ->missing enough confirmation to enter",
                 ],
             }
-        reasons.append(f"[PASS] Confluence score {conf_score}/{MIN_CONFLUENCES}")
+        reasons.append(f"[PASS G4] Confluence score {conf_score} — all gates cleared")
 
         # ── SL / TP ────────────────────────────────────────────
-        sl_price = sweep["sweep_low"] * (1 - SL_BUFFER_PCT)
+        # SL: below sweep low if sweep present, else below nearest zone bottom
+        if sweep["swept"]:
+            sl_price = sweep["sweep_low"] * (1 - SL_BUFFER_PCT)
+        else:
+            sl_price = nearest["low"] * (1 - SL_BUFFER_PCT)
 
         # Build market structure for structural TP
         structure     = build_market_structure(df)

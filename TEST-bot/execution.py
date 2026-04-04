@@ -269,10 +269,11 @@ class OrderExecutor:
     def __init__(self, client: RoostooClient):
         self.client = client
 
-    def execute_buy(self, pair: str, quantity: float, ticker_data: dict) -> dict:
+    def execute_buy(self, pair: str, quantity: float, ticker_data: dict,
+                    price_precision: int = 2) -> dict:
         """Execute a buy order with limit-first strategy."""
         if USE_LIMIT_ORDERS and ticker_data.get("ask"):
-            limit_price = round(ticker_data["ask"] * (1 - LIMIT_ORDER_OFFSET_PCT), 2)
+            limit_price = round(ticker_data["ask"] * (1 - LIMIT_ORDER_OFFSET_PCT), price_precision)
             logger.info(f"Placing LIMIT BUY {pair}: qty={quantity}, price={limit_price}")
             result = self.client.place_order(pair, "BUY", quantity,
                                              price=limit_price, order_type="LIMIT")
@@ -294,10 +295,11 @@ class OrderExecutor:
         logger.info(f"Placing MARKET BUY {pair}: qty={quantity}")
         return self.client.place_order(pair, "BUY", quantity, order_type="MARKET")
 
-    def execute_sell(self, pair: str, quantity: float, ticker_data: dict) -> dict:
+    def execute_sell(self, pair: str, quantity: float, ticker_data: dict,
+                     price_precision: int = 2) -> dict:
         """Execute a sell order with limit-first strategy."""
         if USE_LIMIT_ORDERS and ticker_data.get("bid"):
-            limit_price = round(ticker_data["bid"] * (1 + LIMIT_ORDER_OFFSET_PCT), 2)
+            limit_price = round(ticker_data["bid"] * (1 + LIMIT_ORDER_OFFSET_PCT), price_precision)
             logger.info(f"Placing LIMIT SELL {pair}: qty={quantity}, price={limit_price}")
             result = self.client.place_order(pair, "SELL", quantity,
                                              price=limit_price, order_type="LIMIT")

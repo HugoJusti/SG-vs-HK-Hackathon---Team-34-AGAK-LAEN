@@ -113,6 +113,69 @@ def load_or_fetch_historical(pair: str, force_refresh: bool = False) -> pd.DataF
     return df
 
 
+def append_new_candles(pair: str) -> pd.DataFrame:
+    """
+    Incrementally update the 5m cache by fetching only candles newer than the
+    last cached timestamp.  Much faster than a full 14-day re-fetch.
+    Falls back to a full fetch if no cache exists.
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+    symbol     = pair_to_binance_symbol(pair)
+    cache_path = os.path.join(DATA_DIR, f"{symbol}_5m.csv")
+
+    if not os.path.exists(cache_path):
+        return load_or_fetch_historical(pair, force_refresh=True)
+
+    df      = pd.read_csv(cache_path, parse_dates=["open_time"])
+    last_ts = df["open_time"].iloc[-1]
+
+    # Fetch only candles after the last cached bar (+ 1 ms to avoid overlap)
+    start_ms = int(last_ts.timestamp() * 1000) + 1
+    end_ms   = int(time.time() * 1000)
+
+    if end_ms - start_ms < 60_000:          # less than 1 minute — nothing new
+        return df
+
+    url    = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol":    symbol,
+        "interval":  "5m",
+        "startTime": start_ms,
+        "endTime":   end_ms,
+        "limit":     1000,
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        rows = resp.json()
+    except requests.exceptions.RequestException as e:
+        logger.error("append_new_candles: Binance error for %s: %s", symbol, e)
+        return df
+
+    if not rows:
+        return df
+
+    new_df = pd.DataFrame(rows, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "num_trades",
+        "taker_buy_volume", "taker_buy_quote_volume", "ignore",
+    ])
+    new_df["open_time"] = pd.to_datetime(new_df["open_time"], unit="ms")
+    for col in ["open", "high", "low", "close", "volume"]:
+        new_df[col] = new_df[col].astype(float)
+    new_df = new_df[["open_time", "open", "high", "low", "close", "volume"]]
+
+    combined = (pd.concat([df, new_df])
+                .drop_duplicates(subset=["open_time"])
+                .sort_values("open_time")
+                .reset_index(drop=True))
+
+    combined.to_csv(cache_path, index=False)
+    logger.info("append_new_candles: %s +%d new candles → %d total",
+                symbol, len(new_df), len(combined))
+    return combined
+
+
 def load_or_fetch_htf(pair: str, force_refresh: bool = False) -> pd.DataFrame:
     """
     Load 1H (HTF) data from local CSV cache (if < 4h old), otherwise fetch from Binance.

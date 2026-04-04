@@ -15,8 +15,9 @@ BASE_URL   = "https://mock-api.roostoo.com"
 PAIRS = ["TRX/USD", "TAO/USD", "SOL/USD"]  # bullish-trend altcoins
 
 # ── Historical Data ──────────────────────────────────────────
-DATA_FETCH_HOURS            = 14 * 24   # 14 days of 5m candles (~4032 candles)
-DATA_REFRESH_INTERVAL_HOURS = 1         # re-fetch every hour during live run
+DATA_FETCH_HOURS              = 14 * 24   # 14 days of 5m candles (~4032 candles)
+DATA_REFRESH_INTERVAL_HOURS  = 1         # kept for HTF (1H) refresh cadence
+DATA_REFRESH_INTERVAL_MINUTES = 5        # 5m candles refreshed every new bar
 
 # ── Swing Structure Detection ────────────────────────────────
 SWING_LEFT_BARS  = 3    # fractal bars required to the left of swing point
@@ -34,7 +35,6 @@ SWEEP_WICK_RATIO_MIN = 0.30   # lower wick must be ≥ 30% of total candle range
 
 # ── Break of Structure ───────────────────────────────────────
 BOS_LOOKBACK     = 30     # look back N candles for the most recent swing high
-BOS_LIVE_BUFFER  = 0.001  # live price must exceed BOS level by 0.1% to avoid wick entries
 
 # ── Indicators ───────────────────────────────────────────────
 RSI_PERIOD         = 14
@@ -54,16 +54,19 @@ HTF_INTERVAL  = "1h"   # timeframe for macro trend bias
 HTF_FETCH_DAYS = 30    # how many days of 1H candles to fetch
 
 # ── Confluences (weighted scoring) ───────────────────────────
-# vol_spike and fvg are direct smart-money fingerprints → worth 2pts each
-# rsi, macd, ema50 are supporting indicators → worth 1pt each  (max score = 7)
+# Sweep presence: 2pts  (stop-hunt fingerprint — optional bonus)
+# Vol spike on sweep: 1pt extra if sweep also had volume
+# fvg: 2pts  (price inefficiency near entry)
+# ema50, macd, rsi: 1pt each (supporting filters)
+# Max score = 9 (with sweep+vol) or 5 (without sweep)
 CONFLUENCE_WEIGHTS = {
-    "vol_spike": 2,
+    "vol_spike": 2,   # reused as sweep-presence weight
     "fvg":       2,
     "ema50":     1,
     "macd":      1,
     "rsi":       1,
 }
-MIN_CONFLUENCES = 4  # minimum weighted score required to enter (out of 7)
+MIN_CONFLUENCES = 4  # minimum weighted score required to enter (out of 9)
 
 # ── Entry Filter ─────────────────────────────────────────────
 ENTRY_SPREAD_MAX_PCT = 0.05  # skip pair if bid-ask spread exceeds this
@@ -78,6 +81,9 @@ SL_BUFFER_PCT    = 0.002  # place SL 0.2% below the sweep wick low
 TP_MIN_PCT       = 0.008  # minimum take profit of 0.8%
 TP_MAX_PCT       = 0.04   # cap take profit at 4%
 RECONCILE_SL_PCT = 0.03   # fallback SL for reconciled positions: 3% below current price
+
+# ── Concurrent Positions ────────────────────────────────────
+MAX_CONCURRENT_POSITIONS = 2   # at most 2 open trades across all pairs at once
 
 # ── Cooldown ─────────────────────────────────────────────────
 COOLDOWN_MIN_MINUTES        = 10    # minimum wait after closing a position

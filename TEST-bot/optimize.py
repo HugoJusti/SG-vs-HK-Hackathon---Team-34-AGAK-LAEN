@@ -1,341 +1,353 @@
 """
-Backtest Optimizer
-==================
-Finds the best entry/exit parameters using random search over historical data.
+SMC Backtest Engine
+===================
+Backtests the EXACT same SMCSignalGenerator logic used by the live bot.
 
-- Splits data: first 80% for optimization, last 20% for out-of-sample test
-- Uses random search (300 iterations) to maximize final portfolio value
-- Simulates realistic trading: 0.05% commission, position sizing, stop loss, take profit
-- Reports top 5 parameter sets and final balance starting from $50,000
+- Same pairs:      TRX/USD, TAO/USD, SOL/USD
+- Same data:       5-minute candles + 1H HTF filter
+- Same strategy:   strategy.py → SMCSignalGenerator (no separate model)
+- Same SL/TP:      sweep-low SL, structural/ATR TP
+- Same trailing:   get_trailing_sl() called every bar
+- Same spread:     simulated at BACKTEST_SPREAD_PCT
+
+Split: first 80% optimisation, last 20% out-of-sample test.
+Reports: return, trades, win rate, max drawdown, profit factor, expectancy.
 
 Usage:
     python optimize.py
 """
 
 import os
-import pickle
+import sys
+import warnings
 import numpy as np
 import pandas as pd
-import random
-import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 
 warnings.filterwarnings("ignore")
 
-# ── Config ────────────────────────────────────────────────────
-STARTING_BALANCE   = 50_000.0
-COMMISSION         = 0.0005       # 0.05% per trade (Roostoo rate)
-N_RANDOM_TRIALS    = 50           # number of random parameter sets to try
-PAIRS              = ["BTC/USD", "ETH/USD", "ZEC/USD"]
-DATA_DIR           = "data"
-MODEL_DIR          = "models"
-EMA_SPAN           = 20           # matches ENTRY_MA_SHORT in config
-MOMENTUM_PERIODS   = 10           # matches data.py
+# ── make sure project root is on path ────────────────────────────
+sys.path.insert(0, os.path.dirname(__file__))
 
-# ── Parameter search space ────────────────────────────────────
-FIXED_STOP_LOSS    = 0.03    # fixed 3%
-FIXED_TAKE_PROFIT  = 0.03    # fixed 3%
+from data import load_or_fetch_historical, load_or_fetch_htf, compute_smc_indicators
+from strategy import SMCSignalGenerator, get_trailing_sl
 
-PARAM_SPACE = {
-    "hmm_confidence":    (0.50, 0.90),   # ENTRY_HMM_CONFIDENCE
-    "max_volatility":    (0.30, 3.00),   # ENTRY_MAX_VOLATILITY
-    "momentum_min":      (-0.01, 0.02),  # ENTRY_MOMENTUM_MIN
-    "vol_zscore_max":    (2.00, 6.00),   # ENTRY_VOLUME_ZSCORE_MAX
-    "spread_max_pct":    (0.01, 0.10),   # ENTRY_SPREAD_MAX_PCT
-    "position_pct":      (0.10, 0.40),   # MC_MAX_POSITION_PCT
-}
+# ── Backtest settings ─────────────────────────────────────────────
+STARTING_BALANCE    = 50_000.0
+COMMISSION          = 0.0005          # 0.05% per side (Roostoo rate)
+BACKTEST_SPREAD_PCT = 0.001           # 0.1% simulated spread
+WARMUP_CANDLES      = 300             # candles needed before first signal
+PAIRS               = ["TRX/USD", "TAO/USD", "SOL/USD"]
 
 
 # ═══════════════════════════════════════════════════════════════
-# DATA LOADING & FEATURE ENGINEERING
+# DATA LOADING
 # ═══════════════════════════════════════════════════════════════
 
-def load_data(pair: str) -> pd.DataFrame:
-    coin = pair.split("/")[0]
-    path = os.path.join(DATA_DIR, f"{coin}USDT_1h.csv")
-    if not os.path.exists(path):
-        print(f"  [WARN] No data file for {pair}, skipping.")
-        return pd.DataFrame()
-    df = pd.read_csv(path, parse_dates=["open_time"])
-    df = df.sort_values("open_time").reset_index(drop=True)
-    return df
+def load_pair(pair: str):
+    """
+    Load 5m + 1H data for a pair, compute SMC indicators.
+    Returns (df_5m, df_1h) or (empty, empty) on failure.
+    """
+    print(f"  Loading {pair}…", end=" ", flush=True)
+    df5 = load_or_fetch_historical(pair, force_refresh=False)
+    if df5.empty:
+        print("NO 5m DATA")
+        return pd.DataFrame(), pd.DataFrame()
+    df5 = compute_smc_indicators(df5)
 
+    df1h = load_or_fetch_htf(pair, force_refresh=False)
+    if not df1h.empty:
+        df1h = compute_smc_indicators(df1h)
 
-def compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["log_return"]    = np.log(df["close"] / df["close"].shift(1))
-    df["rolling_vol"]   = df["log_return"].rolling(20).std() * np.sqrt(105120)
-    df["momentum"]      = df["close"].pct_change(periods=MOMENTUM_PERIODS)
-    vol_mean            = df["volume"].rolling(20).mean()
-    vol_std             = df["volume"].rolling(20).std()
-    df["volume_zscore"] = (df["volume"] - vol_mean) / vol_std
-    df["ema20"]         = df["close"].ewm(span=EMA_SPAN, adjust=False).mean()
-    df = df.dropna().reset_index(drop=True)
-    return df
-
-
-def load_hmm(pair: str):
-    path = os.path.join(MODEL_DIR, f"hmm_{pair.replace('/', '_')}.pkl")
-    if not os.path.exists(path):
-        return None
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-def get_regime_probs(hmm, obs: np.ndarray) -> dict:
-    if hmm is None or not hmm.is_trained:
-        return {"bullish": 0.33, "bearish": 0.33, "neutral": 0.34}
-    recent = obs[-288:] if len(obs) > 288 else obs
-    posteriors = hmm.model.predict_proba(recent)
-    current = posteriors[-1]
-    return {
-        "bullish": float(current[hmm.bull_idx]),
-        "bearish": float(current[hmm.bear_idx]),
-        "neutral": float(current[hmm.neut_idx]),
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
-# SIGNAL GENERATION
-# ═══════════════════════════════════════════════════════════════
-
-def generate_signal(row, hmm_probs, position, params):
-    close       = row["close"]
-    has_pos     = position["side"] == "long"
-    entry_price = position.get("entry_price", close)
-
-    # ── EXIT ──
-    if has_pos:
-        drawdown = (entry_price - close) / entry_price
-        if drawdown >= FIXED_STOP_LOSS:
-            return "SELL", "stop_loss"
-        gain = (close - entry_price) / entry_price
-        if gain >= FIXED_TAKE_PROFIT:
-            return "SELL", "take_profit"
-
-    # ── ENTRY ──
-    if not has_pos:
-        mom_ok  = row["momentum"]      > params["momentum_min"]
-        ma_ok   = close                > row["ema20"]
-        hmm_ok  = hmm_probs["bullish"] > params["hmm_confidence"]
-        vol_ok  = row["rolling_vol"]   < params["max_volatility"]
-        vz_ok   = abs(row["volume_zscore"]) < params["vol_zscore_max"]
-
-        # Momentum + EMA20 mandatory; at least 2 of remaining 3 must pass
-        if mom_ok and ma_ok:
-            if sum([hmm_ok, vol_ok, vz_ok]) >= 2:
-                return "BUY", "entry"
-
-    return "HOLD", ""
+    print(f"{len(df5)} × 5m  |  {len(df1h)} × 1H")
+    return df5, df1h
 
 
 # ═══════════════════════════════════════════════════════════════
 # BACKTEST ENGINE
 # ═══════════════════════════════════════════════════════════════
 
-def run_backtest(pair_data: dict, params: dict) -> dict:
+def _htf_slice(df1h: pd.DataFrame, current_time: pd.Timestamp) -> pd.DataFrame:
+    """Return 1H rows whose open_time is at or before current_time."""
+    if df1h.empty or "open_time" not in df1h.columns:
+        return df1h
+    return df1h[df1h["open_time"] <= current_time].reset_index(drop=True)
+
+
+def run_backtest(pair_frames: dict) -> dict:
     """
-    Simulate trading on all pairs simultaneously.
-    Returns final portfolio stats.
+    Simulate SMC trading on all pairs simultaneously.
+    pair_frames: {pair: {"df5": DataFrame, "df1h": DataFrame}}
+    Returns performance stats dict + list of trades.
     """
+    generator = SMCSignalGenerator()
     cash      = STARTING_BALANCE
-    positions = {pair: {"side": "none", "entry_price": 0, "quantity": 0}
-                 for pair in pair_data}
-    trades    = []
 
-    # Find common length (use shortest pair)
-    min_len = min(len(v["df"]) for v in pair_data.values() if not v["df"].empty)
+    positions = {
+        pair: {
+            "side": "none", "entry_price": 0.0,
+            "quantity": 0.0, "sl_price": 0.0,
+            "tp_price": 0.0, "entry_time": "",
+        }
+        for pair in pair_frames
+    }
 
-    for i in range(300, min_len):   # start at 300 to have enough HMM context
-        for pair, v in pair_data.items():
-            df      = v["df"]
-            if df.empty or i >= len(df):
+    trades       = []
+    equity_curve = [STARTING_BALANCE]
+
+    # Use shortest 5m series as the timeline
+    min_len = min(len(v["df5"]) for v in pair_frames.values() if not v["df5"].empty)
+
+    for i in range(WARMUP_CANDLES, min_len):
+        # Mark-to-market equity snapshot
+        bar_value = cash
+        for pair, pos in positions.items():
+            if pos["side"] == "long" and pos["quantity"] > 0:
+                last = pair_frames[pair]["df5"].iloc[i]["close"]
+                bar_value += pos["quantity"] * last
+        equity_curve.append(bar_value)
+
+        for pair, frames in pair_frames.items():
+            df5  = frames["df5"]
+            df1h = frames["df1h"]
+            if df5.empty or i >= len(df5):
                 continue
 
-            row     = df.iloc[i]
-            hmm     = v.get("hmm")
-            obs_arr = v.get("obs")
+            df_slice = df5.iloc[: i + 1].reset_index(drop=True)
+            row      = df_slice.iloc[-1]
+            current_price = float(row["close"])
 
-            if hmm is None or obs_arr is None:
-                continue
+            # Simulate spread: ask slightly above close
+            ask = current_price * (1 + BACKTEST_SPREAD_PCT / 2)
+            bid = current_price * (1 - BACKTEST_SPREAD_PCT / 2)
 
-            obs_slice  = obs_arr[:i]
-            hmm_probs  = get_regime_probs(hmm, obs_slice)
-            pos        = positions[pair]
-            signal, reason = generate_signal(row, hmm_probs, pos, params)
+            pos = positions[pair]
 
-            if signal == "BUY" and pos["side"] == "none":
-                position_usd = cash * params["position_pct"]
+            # ── Trailing SL (before signal, so exit uses updated SL) ──
+            if pos["side"] == "long" and pos.get("entry_time"):
+                new_sl = get_trailing_sl(df_slice, pos["entry_time"], pos["sl_price"])
+                if new_sl > pos["sl_price"]:
+                    pos["sl_price"] = new_sl
+
+            # ── HTF slice aligned to current bar time ─────────────────
+            if "open_time" in row.index:
+                htf_slice = _htf_slice(df1h, row["open_time"])
+            else:
+                htf_slice = df1h
+
+            signal = generator.generate_signal(
+                df_slice, current_price, BACKTEST_SPREAD_PCT, pos,
+                htf_df=htf_slice if not htf_slice.empty else None,
+            )
+
+            # ── Execute BUY ───────────────────────────────────────────
+            if signal["action"] == "BUY" and pos["side"] == "none":
+                from strategy import calculate_position_size
+                sl_price = signal["sl_price"]
+                tp_price = signal["tp_price"]
+
+                sizing       = calculate_position_size(cash, ask, sl_price)
+                position_usd = sizing["position_usd"]
+
                 if position_usd < 1.0 or cash < position_usd:
                     continue
-                price    = row["close"] * (1 + COMMISSION)
-                qty      = position_usd / price
-                cash    -= position_usd
-                positions[pair] = {"side": "long", "entry_price": price, "quantity": qty}
-                trades.append({"pair": pair, "side": "BUY",  "price": price,
-                               "qty": qty, "time": row["open_time"], "reason": reason})
 
-            elif signal == "SELL" and pos["side"] == "long":
-                price   = row["close"] * (1 - COMMISSION)
-                qty     = pos["quantity"]
-                cash   += qty * price
-                pnl     = (price - pos["entry_price"]) * qty
-                trades.append({"pair": pair, "side": "SELL", "price": price,
-                               "qty": qty, "time": row["open_time"], "reason": reason,
-                               "pnl": pnl})
-                positions[pair] = {"side": "none", "entry_price": 0, "quantity": 0}
+                fill_price = ask * (1 + COMMISSION)
+                quantity   = position_usd / fill_price
+                cash      -= position_usd
 
-    # Mark-to-market open positions at last price
+                entry_time = str(row.get("open_time", i))
+                positions[pair] = {
+                    "side":        "long",
+                    "entry_price": round(fill_price, 8),
+                    "quantity":    quantity,
+                    "sl_price":    sl_price,
+                    "tp_price":    tp_price,
+                    "entry_time":  entry_time,
+                }
+                trades.append({
+                    "pair":       pair,
+                    "side":       "BUY",
+                    "price":      fill_price,
+                    "qty":        quantity,
+                    "bar":        i,
+                    "time":       entry_time,
+                    "conf_score": signal.get("conf_score"),
+                })
+
+            # ── Execute SELL ──────────────────────────────────────────
+            elif signal["action"] == "SELL" and pos["side"] == "long":
+                fill_price = bid * (1 - COMMISSION)
+                qty        = pos["quantity"]
+                entry      = pos["entry_price"]
+                pnl        = (fill_price - entry) * qty
+                cash      += qty * fill_price
+
+                sell_time = str(row.get("open_time", i))
+                trades.append({
+                    "pair":    pair,
+                    "side":    "SELL",
+                    "price":   fill_price,
+                    "qty":     qty,
+                    "bar":     i,
+                    "time":    sell_time,
+                    "pnl":     round(pnl, 4),
+                    "reason":  signal["reasons"][0] if signal["reasons"] else "",
+                })
+                positions[pair] = {
+                    "side": "none", "entry_price": 0.0,
+                    "quantity": 0.0, "sl_price": 0.0,
+                    "tp_price": 0.0, "entry_time": "",
+                }
+
+    # Mark open positions to market at last bar
     portfolio_value = cash
     for pair, pos in positions.items():
-        if pos["side"] == "long" and not pair_data[pair].get("df", pd.DataFrame()).empty:
-            df    = pair_data[pair].get("df_full")
-            if df is not None and not df.empty:
-                last_price       = df["close"].iloc[-1]
+        if pos["side"] == "long" and pos["quantity"] > 0:
+            df5 = pair_frames[pair]["df5"]
+            if not df5.empty:
+                last_price       = float(df5.iloc[-1]["close"])
                 portfolio_value += pos["quantity"] * last_price * (1 - COMMISSION)
 
-    wins   = [t for t in trades if t.get("side") == "SELL" and t.get("pnl", 0) > 0]
-    losses = [t for t in trades if t.get("side") == "SELL" and t.get("pnl", 0) <= 0]
-    sells  = [t for t in trades if t.get("side") == "SELL"]
-    total_pnl = sum(t.get("pnl", 0) for t in sells)
+    equity_arr = np.array(equity_curve)
+
+    # Performance stats
+    sells        = [t for t in trades if t["side"] == "SELL"]
+    wins         = [t for t in sells if t.get("pnl", 0) > 0]
+    losses       = [t for t in sells if t.get("pnl", 0) <= 0]
+    total_pnl    = sum(t.get("pnl", 0) for t in sells)
+    gross_profit = sum(t["pnl"] for t in wins)
+    gross_loss   = abs(sum(t["pnl"] for t in losses))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+    avg_win   = gross_profit / len(wins)   if wins   else 0
+    avg_loss  = gross_loss  / len(losses)  if losses else 0
+    win_rate  = len(wins) / len(sells) if sells else 0
+    expectancy = (win_rate * avg_win) - ((1 - win_rate) * avg_loss)
+
+    # Max drawdown
+    peak        = np.maximum.accumulate(equity_arr)
+    drawdowns   = (equity_arr - peak) / peak * 100
+    max_dd      = float(drawdowns.min())
 
     return {
         "final_balance":  round(portfolio_value, 2),
         "total_return":   round((portfolio_value - STARTING_BALANCE) / STARTING_BALANCE * 100, 2),
         "n_trades":       len(sells),
-        "win_rate":       round(len(wins) / len(sells) * 100, 1) if sells else 0,
+        "win_rate":       round(win_rate * 100, 1),
         "total_pnl":      round(total_pnl, 2),
+        "profit_factor":  round(profit_factor, 3),
+        "expectancy_usd": round(expectancy, 2),
+        "avg_win_usd":    round(avg_win, 2),
+        "avg_loss_usd":   round(avg_loss, 2),
+        "max_drawdown":   round(max_dd, 2),
+        "trades":         trades,
     }
 
 
 # ═══════════════════════════════════════════════════════════════
-# MAIN OPTIMIZER
+# PRINT HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def print_stats(label: str, stats: dict):
+    print(f"\n{'='*65}")
+    print(f"  {label}")
+    print(f"{'='*65}")
+    print(f"  Starting balance : ${STARTING_BALANCE:>12,.2f}")
+    print(f"  Final balance    : ${stats['final_balance']:>12,.2f}")
+    print(f"  Total return     : {stats['total_return']:>+10.2f}%")
+    print(f"  Total trades     : {stats['n_trades']:>12}")
+    print(f"  Win rate         : {stats['win_rate']:>11.1f}%")
+    print(f"  Profit factor    : {stats['profit_factor']:>12.3f}")
+    print(f"  Expectancy       : ${stats['expectancy_usd']:>11.2f}  per trade")
+    print(f"  Avg win          : ${stats['avg_win_usd']:>11.2f}")
+    print(f"  Avg loss         : ${stats['avg_loss_usd']:>11.2f}")
+    print(f"  Max drawdown     : {stats['max_drawdown']:>11.2f}%")
+    print(f"  Total PnL        : ${stats['total_pnl']:>11.2f}")
+
+
+def print_trade_log(trades: list, max_rows: int = 20):
+    sells = [t for t in trades if t["side"] == "SELL"]
+    if not sells:
+        return
+    print(f"\n  Last {min(max_rows, len(sells))} closed trades:")
+    print(f"  {'#':<4} {'Pair':<10} {'Time':<22} {'PnL':>10}  Reason")
+    for idx, t in enumerate(sells[-max_rows:], 1):
+        pnl    = t.get("pnl", 0)
+        symbol = "+" if pnl >= 0 else ""
+        reason = t.get("reason", "")[:55]
+        print(f"  {idx:<4} {t['pair']:<10} {str(t['time'])[:22]:<22} "
+              f"{symbol}{pnl:>9.2f}  {reason}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
 # ═══════════════════════════════════════════════════════════════
 
 def main():
     print("=" * 65)
-    print("  BACKTEST OPTIMIZER — Starting balance: $50,000")
+    print("  SMC BACKTEST ENGINE")
+    print(f"  Pairs : {', '.join(PAIRS)}")
+    print(f"  Logic : strategy.py → SMCSignalGenerator (exact live logic)")
+    print(f"  Split : 80% in-sample / 20% out-of-sample")
     print("=" * 65)
 
-    # Load data and HMMs
-    print("\nLoading data and HMM models...")
-    pair_data = {}
+    # Load data
+    print("\nLoading data…")
+    all_frames = {}
     for pair in PAIRS:
-        df_raw = load_data(pair)
-        if df_raw.empty:
-            continue
-        df = compute_features(df_raw)
-        hmm = load_hmm(pair)
+        df5, df1h = load_pair(pair)
+        if not df5.empty:
+            all_frames[pair] = {"df5": df5, "df1h": df1h}
 
-        feature_cols = ["log_return", "rolling_vol", "momentum", "volume_zscore"]
-        obs = df[feature_cols].values
-
-        # Split: 80% train/optimize, 20% out-of-sample test
-        split = int(len(df) * 0.80)
-        pair_data[pair] = {
-            "df":      df.iloc[:split].reset_index(drop=True),
-            "df_full": df,
-            "obs":     obs[:split],
-            "hmm":     hmm,
-        }
-        print(f"  {pair}: {len(df)} candles | train={split} | test={len(df)-split}")
-
-    if not pair_data:
-        print("No data loaded. Exiting.")
+    if not all_frames:
+        print("No data loaded. Run the bot once to populate the data/ cache.")
         return
 
-    # Also add full obs for test phase
-    for pair in list(pair_data.keys()):
-        df_raw = load_data(pair)
-        df_full = compute_features(df_raw)
-        feature_cols = ["log_return", "rolling_vol", "momentum", "volume_zscore"]
-        pair_data[pair]["obs_full"] = df_full[feature_cols].values
+    # Find split index
+    min_len = min(len(v["df5"]) for v in all_frames.values())
+    split   = int(min_len * 0.80)
+    print(f"\nTotal candles (shortest pair): {min_len}")
+    print(f"In-sample  : 0 → {split}  ({split} bars)")
+    print(f"Out-sample : {split} → {min_len}  ({min_len - split} bars)")
 
-    # Random search
-    print(f"\nRunning {N_RANDOM_TRIALS} random parameter trials on TRAIN data...\n")
-    results = []
+    # ── In-sample backtest ──────────────────────────────────────
+    print("\nRunning IN-SAMPLE backtest…")
+    in_frames = {p: {"df5": v["df5"].iloc[:split].reset_index(drop=True),
+                     "df1h": v["df1h"]}
+                 for p, v in all_frames.items()}
+    in_stats = run_backtest(in_frames)
+    print_stats("IN-SAMPLE RESULTS (first 80%)", in_stats)
+    print_trade_log(in_stats["trades"])
 
-    for trial in range(N_RANDOM_TRIALS):
-        params = {k: random.uniform(v[0], v[1]) for k, v in PARAM_SPACE.items()}
-        stats  = run_backtest(pair_data, params)
-        results.append({"params": params, **stats})
+    # ── Out-of-sample backtest ──────────────────────────────────
+    print("\nRunning OUT-OF-SAMPLE backtest…")
+    oos_frames = {p: {"df5": v["df5"].iloc[split:].reset_index(drop=True),
+                      "df1h": v["df1h"]}
+                  for p, v in all_frames.items()}
+    oos_stats = run_backtest(oos_frames)
+    print_stats("OUT-OF-SAMPLE RESULTS (last 20%)", oos_stats)
+    print_trade_log(oos_stats["trades"])
 
-        if (trial + 1) % 50 == 0:
-            best_so_far = max(results, key=lambda x: x["final_balance"])
-            print(f"  Trial {trial+1:>3}/{N_RANDOM_TRIALS} | "
-                  f"Best so far: ${best_so_far['final_balance']:>10,.2f} "
-                  f"({best_so_far['total_return']:+.2f}%)")
-
-    # Sort by final balance
-    results.sort(key=lambda x: x["final_balance"], reverse=True)
-    top5 = results[:5]
-
-    # ── Print Top 5 ──
-    print("\n" + "=" * 65)
-    print("  TOP 5 PARAMETER SETS (on TRAIN data)")
-    print("=" * 65)
-    for rank, r in enumerate(top5, 1):
-        p = r["params"]
-        print(f"\n  #{rank} | Final: ${r['final_balance']:,.2f} | "
-              f"Return: {r['total_return']:+.2f}% | "
-              f"Trades: {r['n_trades']} | WinRate: {r['win_rate']:.1f}%")
-        print(f"       HMM conf:     {p['hmm_confidence']:.3f}")
-        print(f"       Max vol:      {p['max_volatility']:.3f}")
-        print(f"       Momentum min: {p['momentum_min']:.4f}")
-        print(f"       Vol z-max:    {p['vol_zscore_max']:.3f}")
-        print(f"       Stop loss:    {FIXED_STOP_LOSS*100:.2f}% (fixed)")
-        print(f"       Take profit:  {FIXED_TAKE_PROFIT*100:.2f}% (fixed)")
-        print(f"       Position pct: {p['position_pct']*100:.1f}%")
-
-    # ── Out-of-sample test with best params ──
-    print("\n" + "=" * 65)
-    print("  OUT-OF-SAMPLE TEST (last 20% of data) with best params")
-    print("=" * 65)
-
-    best_params = top5[0]["params"]
-
-    # Rebuild pair_data for test period
-    test_pair_data = {}
+    # ── Per-pair breakdown ──────────────────────────────────────
+    print(f"\n{'='*65}")
+    print("  PER-PAIR TRADE BREAKDOWN (out-of-sample)")
+    print(f"{'='*65}")
     for pair in PAIRS:
-        df_raw = load_data(pair)
-        if df_raw.empty:
+        pair_sells = [t for t in oos_stats["trades"]
+                      if t["side"] == "SELL" and t["pair"] == pair]
+        if not pair_sells:
+            print(f"  {pair:<10}: no closed trades")
             continue
-        df = compute_features(df_raw)
-        hmm = load_hmm(pair)
-        feature_cols = ["log_return", "rolling_vol", "momentum", "volume_zscore"]
-        obs = df[feature_cols].values
-        split = int(len(df) * 0.80)
-        test_pair_data[pair] = {
-            "df":      df.iloc[split:].reset_index(drop=True),
-            "df_full": df.iloc[split:].reset_index(drop=True),
-            "obs":     obs[split:],
-            "hmm":     hmm,
-        }
+        pair_pnl  = sum(t.get("pnl", 0) for t in pair_sells)
+        pair_wins = sum(1 for t in pair_sells if t.get("pnl", 0) > 0)
+        print(f"  {pair:<10}: {len(pair_sells):>3} trades | "
+              f"WR={pair_wins/len(pair_sells)*100:.0f}% | "
+              f"PnL=${pair_pnl:>+,.2f}")
 
-    test_stats = run_backtest(test_pair_data, best_params)
-
-    print(f"\n  Starting balance: ${STARTING_BALANCE:,.2f}")
-    print(f"  Final balance:    ${test_stats['final_balance']:,.2f}")
-    print(f"  Total return:     {test_stats['total_return']:+.2f}%")
-    print(f"  Total trades:     {test_stats['n_trades']}")
-    print(f"  Win rate:         {test_stats['win_rate']:.1f}%")
-    print(f"  Total PnL:        ${test_stats['total_pnl']:,.2f}")
-
-    print("\n" + "=" * 65)
-    print("  RECOMMENDED CONFIG VALUES (copy to config.py)")
-    print("=" * 65)
-    p = best_params
-    print(f"\n  ENTRY_HMM_CONFIDENCE    = {p['hmm_confidence']:.2f}")
-    print(f"  ENTRY_MAX_VOLATILITY    = {p['max_volatility']:.2f}")
-    print(f"  ENTRY_MOMENTUM_MIN      = {p['momentum_min']:.4f}")
-    print(f"  ENTRY_VOLUME_ZSCORE_MAX = {p['vol_zscore_max']:.2f}")
-    print(f"  EXIT_STOP_LOSS_PCT      = {FIXED_STOP_LOSS}  (fixed)")
-    print(f"  EXIT_TAKE_PROFIT_PCT    = {FIXED_TAKE_PROFIT}  (fixed)")
-    print(f"  MC_MAX_POSITION_PCT     = {p['position_pct']:.2f}")
     print()
 
 
 if __name__ == "__main__":
-    random.seed(42)
-    np.random.seed(42)
     main()

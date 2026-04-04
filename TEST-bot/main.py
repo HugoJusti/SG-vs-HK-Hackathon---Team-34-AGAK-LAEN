@@ -26,11 +26,13 @@ warnings.filterwarnings("ignore")
 
 from config import (
     PAIRS, POLL_INTERVAL_SEC, DATA_REFRESH_INTERVAL_HOURS,
+    DATA_REFRESH_INTERVAL_MINUTES,
     LOG_DIR, LOG_LEVEL, LOG_SIGNALS_FILE, LOG_ERRORS_FILE,
-    RECONCILE_SL_PCT, TP_MIN_PCT,
+    RECONCILE_SL_PCT, TP_MIN_PCT, MAX_CONCURRENT_POSITIONS,
 )
 from data import (
-    load_or_fetch_historical, load_or_fetch_htf, compute_smc_indicators,
+    load_or_fetch_historical, load_or_fetch_htf,
+    append_new_candles, compute_smc_indicators,
 )
 from strategy import SMCSignalGenerator, calculate_position_size, get_trailing_sl
 from execution import RoostooClient, OrderExecutor, CooldownManager, rate_limiter
@@ -42,13 +44,16 @@ from execution import RoostooClient, OrderExecutor, CooldownManager, rate_limite
 
 def setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
+    # Force UTF-8 on stdout so Unicode chars don't crash on Windows cp1252
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     logging.basicConfig(
         level=getattr(logging, LOG_LEVEL),
         format="%(asctime)s | %(levelname)-7s | %(name)-12s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(LOG_ERRORS_FILE),
+            logging.FileHandler(LOG_ERRORS_FILE, encoding="utf-8"),
         ],
     )
 
@@ -293,6 +298,11 @@ class TradingBot:
                     portfolio_value += qty * t["last"]
         self.logger.info("Portfolio value: $%s", f"{portfolio_value:,.2f}")
 
+        # Count open positions for concurrent cap
+        open_count = sum(
+            1 for p in PAIRS if self.positions.get(p).get("side") == "long"
+        )
+
         # Per-pair signal loop
         for pair in PAIRS:
             if pair not in self.smc_data:
@@ -317,17 +327,9 @@ class TradingBot:
 
             position = self.positions.get(pair)
             df       = self.smc_data[pair]
-            htf_df   = self.htf_data.get(pair)   # Fix 3: pass HTF to signal gen
+            htf_df   = self.htf_data.get(pair)
 
-            signal = self.signal_gen.generate_signal(
-                df, ticker["last"], ticker["spread_pct"], position, htf_df=htf_df
-            )
-
-            self.logger.info("  Signal: %s", signal["action"])
-            for r in signal["reasons"]:
-                self.logger.info("    %s", r)
-
-            # ── Trailing SL (runs every cycle while holding, before exit check) ──
+            # ── Trailing SL (BEFORE signal gen so exit check uses updated SL) ──
             if position["side"] == "long" and position.get("entry_time"):
                 new_sl = get_trailing_sl(
                     df,
@@ -341,12 +343,28 @@ class TradingBot:
                         (new_sl - position["sl_price"]) / position["sl_price"] * 100,
                     )
                     self.positions.update_sl(pair, new_sl)
-                    position = self.positions.get(pair)   # refresh for exit check below
+                    position = self.positions.get(pair)
+
+            signal = self.signal_gen.generate_signal(
+                df, ticker["last"], ticker["spread_pct"], position, htf_df=htf_df
+            )
+
+            self.logger.info("  Signal: %s", signal["action"])
+            for r in signal["reasons"]:
+                self.logger.info("    %s", r)
 
             if signal["action"] == "BUY":
-                self._execute_buy(pair, ticker, portfolio_value, signal)
+                if open_count >= MAX_CONCURRENT_POSITIONS:
+                    self.logger.info(
+                        "  BUY blocked: %d/%d positions already open",
+                        open_count, MAX_CONCURRENT_POSITIONS,
+                    )
+                else:
+                    self._execute_buy(pair, ticker, portfolio_value, signal)
+                    open_count += 1
             elif signal["action"] == "SELL":
                 self._execute_sell(pair, ticker, signal)
+                open_count -= 1
 
             self._log_signal(pair, signal, ticker, position)
 
@@ -367,16 +385,17 @@ class TradingBot:
 
         quantity = position_usd / entry_price
 
-        # Fix 4: use cached exchange_info, no extra API call
-        pair_info = self.exchange_info.get("TradePairs", {}).get(pair, {})
-        precision = pair_info.get("AmountPrecision", 6)
-        step      = pair_info.get("AmountStep", None)
+        # Use cached exchange_info for both quantity AND price precision
+        pair_info       = self.exchange_info.get("TradePairs", {}).get(pair, {})
+        qty_precision   = pair_info.get("AmountPrecision", 6)
+        price_precision = pair_info.get("PricePrecision", 2)
+        step            = pair_info.get("AmountStep", None)
 
         if step and step > 0:
             quantity = int(quantity / step) * step
-            quantity = round(quantity, precision)
+            quantity = round(quantity, qty_precision)
         else:
-            factor   = 10 ** precision
+            factor   = 10 ** qty_precision
             quantity = int(quantity * factor) / factor
 
         if quantity * entry_price < 1.0:
@@ -393,7 +412,7 @@ class TradingBot:
             sizing["sl_distance_pct"],
         )
 
-        result = self.executor.execute_buy(pair, quantity, ticker)
+        result = self.executor.execute_buy(pair, quantity, ticker, price_precision=price_precision)
 
         if result.get("Success"):
             filled     = result.get("OrderDetail", {}).get("FilledAverPrice", entry_price) or entry_price
@@ -406,8 +425,10 @@ class TradingBot:
     # ── Sell ─────────────────────────────────────────────────────
 
     def _execute_sell(self, pair: str, ticker: dict, signal: dict):
-        position = self.positions.get(pair)
-        quantity = position.get("quantity", 0)
+        position        = self.positions.get(pair)
+        quantity        = position.get("quantity", 0)
+        pair_info       = self.exchange_info.get("TradePairs", {}).get(pair, {})
+        price_precision = pair_info.get("PricePrecision", 2)
 
         if quantity <= 0:
             self.logger.warning("  No position to sell for %s", pair)
@@ -419,7 +440,7 @@ class TradingBot:
             signal["reasons"][0] if signal["reasons"] else "signal",
         )
 
-        result = self.executor.execute_sell(pair, quantity, ticker)
+        result = self.executor.execute_sell(pair, quantity, ticker, price_precision=price_precision)
 
         if result.get("Success"):
             filled  = result.get("OrderDetail", {}).get("FilledAverPrice", ticker["bid"]) or ticker["bid"]
@@ -434,18 +455,40 @@ class TradingBot:
     # ── Data refresh ─────────────────────────────────────────────
 
     def _maybe_refresh_data(self):
+        now = datetime.utcnow()
         for pair in PAIRS:
-            if pair not in self.last_refresh:
+            last = self.last_refresh.get(pair)
+            if last is None:
                 continue
-            hours_since = (datetime.utcnow() - self.last_refresh[pair]).total_seconds() / 3600
-            if hours_since >= DATA_REFRESH_INTERVAL_HOURS:
+
+            minutes_since = (now - last).total_seconds() / 60
+            hours_since   = minutes_since / 60
+
+            # 5m candles: incremental append every DATA_REFRESH_INTERVAL_MINUTES
+            if minutes_since >= DATA_REFRESH_INTERVAL_MINUTES:
                 self.logger.info(
-                    "Refreshing data for %s (%.1fh since last fetch)", pair, hours_since
+                    "Appending new 5m candles for %s (%.1f min since last)", pair, minutes_since
                 )
                 try:
-                    self._refresh_data(pair, force=True)
+                    df = append_new_candles(pair)
+                    if not df.empty:
+                        self.smc_data[pair]  = compute_smc_indicators(df)
+                        self.last_refresh[pair] = now
+                        self.logger.info(
+                            "%s: %d × 5m candles (incremental update)", pair, len(self.smc_data[pair])
+                        )
                 except Exception as e:
-                    self.logger.error("Data refresh failed for %s: %s", pair, e)
+                    self.logger.error("5m append failed for %s: %s", pair, e)
+
+            # 1H HTF: full refresh every DATA_REFRESH_INTERVAL_HOURS
+            if hours_since >= DATA_REFRESH_INTERVAL_HOURS:
+                self.logger.info("Refreshing 1H HTF data for %s", pair)
+                try:
+                    htf_df = load_or_fetch_htf(pair, force_refresh=True)
+                    if not htf_df.empty:
+                        self.htf_data[pair] = compute_smc_indicators(htf_df)
+                except Exception as e:
+                    self.logger.error("HTF refresh failed for %s: %s", pair, e)
 
     # ── Signal logger ────────────────────────────────────────────
 
