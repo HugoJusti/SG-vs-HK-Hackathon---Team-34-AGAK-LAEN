@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Strategy: Smart Money Concept (SMC) — v3
 
