@@ -12,7 +12,7 @@ SECRET_KEY = os.getenv("RST_SECRET_KEY", "YOUR_SECRET_KEY_HERE")
 BASE_URL   = "https://mock-api.roostoo.com"
 
 # ── Trading Pairs ────────────────────────────────────────────
-PAIRS = ["TRX/USD", "TAO/USD", "SOL/USD", "FET/USD", "ALGO/USD"]  # bullish-trend altcoins
+PAIRS = ["TRX/USD", "TAO/USD", "SOL/USD", "FET/USD"]  # bullish-trend altcoins
 
 # ── Historical Data ──────────────────────────────────────────
 DATA_FETCH_HOURS              = 14 * 24   # 14 days of 5m candles (~4032 candles)
