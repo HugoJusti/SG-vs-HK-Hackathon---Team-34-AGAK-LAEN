@@ -74,14 +74,22 @@ ENTRY_SPREAD_MAX_PCT = 0.05  # skip pair if bid-ask spread exceeds this
 
 # ── Position Sizing (risk-based) ─────────────────────────────
 RISK_PER_TRADE_PCT = 0.02   # risk 2% of portfolio on each trade
-MAX_POSITION_PCT   = 0.30   # hard cap: no more than 30% per trade
+MAX_POSITION_PCT   = 0.20   # hard cap: no more than 20% per trade (reduced from 30%)
 MIN_POSITION_PCT   = 0.05   # floor: at least 5% if SL is very wide
+
+# ── SL Distance Guards ───────────────────────────────────────
+MAX_SL_DISTANCE_PCT = 0.04  # skip trade if SL is more than 4% below entry (too wide = too much exposure)
+MIN_SL_DISTANCE_PCT = 0.003 # skip trade if SL is less than 0.3% below entry (too tight = noise stop-out)
+
+# ── Drawdown-based Position Scaling ─────────────────────────
+DRAWDOWN_SCALE_THRESHOLD = 0.05   # if portfolio drops 5% from its peak, scale down position size
+DRAWDOWN_SCALE_FACTOR    = 0.50   # scale to 50% of normal size while in drawdown
 
 # ── Stop Loss / Take Profit ──────────────────────────────────
 SL_BUFFER_PCT    = 0.002  # place SL 0.2% below the sweep wick low
 TP_MIN_PCT       = 0.008  # minimum take profit of 0.8%
 TP_MAX_PCT       = 0.04   # cap take profit at 4%
-MIN_RR_RATIO     = 2.0  # minimum reward:risk ratio — skip trade if TP can't reach this
+MIN_RR_RATIO     = 2.0    # minimum reward:risk ratio — skip trade if TP can't reach this
 RECONCILE_SL_PCT = 0.03   # fallback SL for reconciled positions: 3% below current price
 
 # ── Concurrent Positions ────────────────────────────────────

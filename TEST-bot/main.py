@@ -30,6 +30,7 @@ from config import (
     LOG_DIR, LOG_LEVEL, LOG_SIGNALS_FILE, LOG_ERRORS_FILE,
     RECONCILE_SL_PCT, TP_MIN_PCT, MAX_CONCURRENT_POSITIONS,
     RISK_PER_TRADE_PCT, MAX_DAILY_LOSS_PCT,
+    DRAWDOWN_SCALE_THRESHOLD, DRAWDOWN_SCALE_FACTOR,
 )
 from data import (
     load_or_fetch_historical, load_or_fetch_htf,
@@ -186,6 +187,9 @@ class TradingBot:
         self.daily_start_value = 0.0   # portfolio value at start of today
         self.daily_date        = None  # calendar date of daily_start_value snapshot
 
+        # Drawdown-based position scaling
+        self.portfolio_peak = 0.0      # highest portfolio value seen since bot started
+
     # ── Initialisation ──────────────────────────────────────────
 
     def initialise(self):
@@ -303,6 +307,21 @@ class TradingBot:
                     portfolio_value += qty * t["last"]
         self.logger.info("Portfolio value: $%s", f"{portfolio_value:,.2f}")
 
+        # ── Drawdown-based position scaling ───────────────────────
+        if portfolio_value > self.portfolio_peak:
+            self.portfolio_peak = portfolio_value
+        drawdown_pct = (self.portfolio_peak - portfolio_value) / self.portfolio_peak \
+                       if self.portfolio_peak > 0 else 0.0
+        if drawdown_pct >= DRAWDOWN_SCALE_THRESHOLD:
+            drawdown_factor = DRAWDOWN_SCALE_FACTOR
+            self.logger.warning(
+                "DRAWDOWN MODE: portfolio %.2f%% below peak $%.2f — "
+                "position size scaled to %.0f%%",
+                drawdown_pct * 100, self.portfolio_peak, DRAWDOWN_SCALE_FACTOR * 100,
+            )
+        else:
+            drawdown_factor = 1.0
+
         # ── Daily loss circuit breaker ────────────────────────────
         today = datetime.utcnow().date()
         if self.daily_date != today:
@@ -388,7 +407,7 @@ class TradingBot:
                         open_count, MAX_CONCURRENT_POSITIONS,
                     )
                 else:
-                    self._execute_buy(pair, ticker, portfolio_value, signal)
+                    self._execute_buy(pair, ticker, portfolio_value, signal, drawdown_factor)
                     open_count += 1
             elif signal["action"] == "SELL":
                 self._execute_sell(pair, ticker, signal)
@@ -399,12 +418,14 @@ class TradingBot:
     # ── Buy ──────────────────────────────────────────────────────
 
     def _execute_buy(self, pair: str, ticker: dict,
-                     portfolio_value: float, signal: dict):
+                     portfolio_value: float, signal: dict,
+                     drawdown_factor: float = 1.0):
         entry_price = ticker["ask"]
         sl_price    = signal["sl_price"]
         tp_price    = signal["tp_price"]
 
-        sizing       = calculate_position_size(portfolio_value, entry_price, sl_price)
+        sizing       = calculate_position_size(portfolio_value, entry_price, sl_price,
+                                               drawdown_factor=drawdown_factor)
         position_usd = sizing["position_usd"]
 
         if position_usd < 1.0:
@@ -439,14 +460,15 @@ class TradingBot:
                 actual_risk_pct, target_risk_pct,
             )
 
+        scale_tag = f" | DRAWDOWN SCALE x{drawdown_factor:.1f}" if drawdown_factor < 1.0 else ""
         self.logger.info(
             "  BUYING %s: qty=%.6f | ~$%.2f (%.1f%% of portfolio) | "
-            "SL=%.4f | TP=%.4f | Target risk=%.2f%% | Actual risk=%.2f%% | SL-dist=%.4f%%",
+            "SL=%.4f | TP=%.4f | Target risk=%.2f%% | Actual risk=%.2f%% | SL-dist=%.4f%%%s",
             pair, quantity, position_usd,
             sizing["position_pct"] * 100,
             sl_price, tp_price,
             target_risk_pct, actual_risk_pct,
-            sizing["sl_distance_pct"],
+            sizing["sl_distance_pct"], scale_tag,
         )
 
         result = self.executor.execute_buy(pair, quantity, ticker, price_precision=price_precision)
