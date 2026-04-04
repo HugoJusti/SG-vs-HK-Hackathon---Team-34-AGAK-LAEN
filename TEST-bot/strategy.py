@@ -18,6 +18,38 @@ from config import (
 logger = logging.getLogger(__name__)
 
 
+def _merge_signal_params(params: dict | None = None) -> dict:
+    merged = {
+        "entry_hmm_confidence": ENTRY_HMM_CONFIDENCE,
+        "entry_max_volatility": ENTRY_MAX_VOLATILITY,
+        "entry_momentum_min": ENTRY_MOMENTUM_MIN,
+        "entry_volume_zscore_max": ENTRY_VOLUME_ZSCORE_MAX,
+        "entry_spread_max_pct": ENTRY_SPREAD_MAX_PCT,
+        "exit_stop_loss_pct": EXIT_STOP_LOSS_PCT,
+        "exit_take_profit_pct": EXIT_TAKE_PROFIT_PCT,
+    }
+    if params:
+        for key in list(merged.keys()):
+            if key in params and params[key] is not None:
+                merged[key] = params[key]
+    return merged
+
+
+def _merge_mc_params(params: dict | None = None) -> dict:
+    merged = {
+        "mc_num_simulations": MC_NUM_SIMULATIONS,
+        "mc_horizon_hours": MC_HORIZON_HOURS,
+        "mc_max_position_pct": MC_MAX_POSITION_PCT,
+        "mc_min_position_pct": MC_MIN_POSITION_PCT,
+        "mc_tail_risk_limit": MC_TAIL_RISK_LIMIT,
+    }
+    if params:
+        for key in list(merged.keys()):
+            if key in params and params[key] is not None:
+                merged[key] = params[key]
+    return merged
+
+
 # ═══════════════════════════════════════════════════════════════
 # HMM REGIME MODEL
 # ═══════════════════════════════════════════════════════════════
@@ -128,16 +160,18 @@ class RegimeHMM:
 # ═══════════════════════════════════════════════════════════════
 
 def monte_carlo_position_size(regime_params: dict, current_regime_idx: int,
-                              portfolio_value: float) -> dict:
+                              portfolio_value: float, params: dict | None = None) -> dict:
     """
     Run Monte Carlo simulation to determine position size.
     MC no longer gates trades — only sizes them.
     Returns minimum position (5%) if tail risk is too high, else maximum (30%).
     """
+    mc_params = _merge_mc_params(params)
+
     if regime_params is None:
         return {
-            "position_pct": MC_MIN_POSITION_PCT,
-            "position_usd": portfolio_value * MC_MIN_POSITION_PCT,
+            "position_pct": mc_params["mc_min_position_pct"],
+            "position_usd": portfolio_value * mc_params["mc_min_position_pct"],
             "paths_positive_pct": 0.5,
             "median_return": 0.0,
             "tail_risk_5pct": 0.0,
@@ -147,8 +181,8 @@ def monte_carlo_position_size(regime_params: dict, current_regime_idx: int,
     stds = np.sqrt(regime_params["covars"][:, 0, 0])
     transmat = regime_params["transmat"]
 
-    n_sims = MC_NUM_SIMULATIONS
-    horizon = MC_HORIZON_HOURS
+    n_sims = int(mc_params["mc_num_simulations"])
+    horizon = int(mc_params["mc_horizon_hours"])
     final_returns = np.zeros(n_sims)
 
     for sim in range(n_sims):
@@ -167,10 +201,10 @@ def monte_carlo_position_size(regime_params: dict, current_regime_idx: int,
     tail_risk = np.percentile(final_returns, 5)
 
     # MC only sizes — does not gate trades
-    if tail_risk < -MC_TAIL_RISK_LIMIT:
-        position_pct = MC_MIN_POSITION_PCT
+    if tail_risk < -mc_params["mc_tail_risk_limit"]:
+        position_pct = mc_params["mc_min_position_pct"]
     else:
-        position_pct = MC_MAX_POSITION_PCT
+        position_pct = mc_params["mc_max_position_pct"]
 
     result = {
         "position_pct": round(position_pct, 4),
@@ -201,7 +235,8 @@ class SignalGenerator:
     """
 
     def generate_signal(self, regime_probs: dict, features: dict,
-                        spread_pct: float, current_position: dict) -> dict:
+                        spread_pct: float, current_position: dict,
+                        params: dict | None = None) -> dict:
         """
         Entry logic:
           - Mandatory: momentum > 0 AND price > EMA20
@@ -211,6 +246,7 @@ class SignalGenerator:
           - Stop loss: drawdown >= 3%
           - Take profit: gain >= 3%
         """
+        signal_params = _merge_signal_params(params)
         action = "HOLD"
         reasons = []
 
@@ -222,18 +258,24 @@ class SignalGenerator:
             entry_price = current_position.get("entry_price", close)
             drawdown = (entry_price - close) / entry_price
 
-            if drawdown >= EXIT_STOP_LOSS_PCT:
+            if drawdown >= signal_params["exit_stop_loss_pct"]:
                 return {
                     "action": "SELL",
-                    "reasons": [f"STOP LOSS: drawdown {drawdown*100:.2f}% >= {EXIT_STOP_LOSS_PCT*100}%"],
+                    "reasons": [
+                        f"STOP LOSS: drawdown {drawdown*100:.2f}% >= "
+                        f"{signal_params['exit_stop_loss_pct']*100}%"
+                    ],
                     "confidence": 1.0
                 }
 
             gain = (close - entry_price) / entry_price
-            if gain >= EXIT_TAKE_PROFIT_PCT:
+            if gain >= signal_params["exit_take_profit_pct"]:
                 return {
                     "action": "SELL",
-                    "reasons": [f"TAKE PROFIT: gain {gain*100:.2f}% >= {EXIT_TAKE_PROFIT_PCT*100}%"],
+                    "reasons": [
+                        f"TAKE PROFIT: gain {gain*100:.2f}% >= "
+                        f"{signal_params['exit_take_profit_pct']*100}%"
+                    ],
                     "confidence": 1.0
                 }
 
@@ -242,24 +284,24 @@ class SignalGenerator:
             entry_checks = []
 
             # 1. HMM bullish
-            hmm_ok = regime_probs["bullish"] > ENTRY_HMM_CONFIDENCE
+            hmm_ok = regime_probs["bullish"] > signal_params["entry_hmm_confidence"]
             entry_checks.append(("HMM bullish", hmm_ok,
-                                 f"P(bull)={regime_probs['bullish']:.3f} vs {ENTRY_HMM_CONFIDENCE}"))
+                                 f"P(bull)={regime_probs['bullish']:.3f} vs {signal_params['entry_hmm_confidence']}"))
 
             # 2. Volatility filter
-            vol_ok = features["rolling_vol"] < ENTRY_MAX_VOLATILITY
+            vol_ok = features["rolling_vol"] < signal_params["entry_max_volatility"]
             entry_checks.append(("Vol filter", vol_ok,
-                                 f"vol={features['rolling_vol']:.4f} vs {ENTRY_MAX_VOLATILITY}"))
+                                 f"vol={features['rolling_vol']:.4f} vs {signal_params['entry_max_volatility']}"))
 
             # 3. Momentum filter (mandatory)
-            mom_ok = features["momentum"] > ENTRY_MOMENTUM_MIN
+            mom_ok = features["momentum"] > signal_params["entry_momentum_min"]
             entry_checks.append(("Momentum", mom_ok,
-                                 f"mom={features['momentum']:.6f} vs {ENTRY_MOMENTUM_MIN}"))
+                                 f"mom={features['momentum']:.6f} vs {signal_params['entry_momentum_min']}"))
 
             # 4. Volume z-score filter
-            vz_ok = abs(features["volume_zscore"]) < ENTRY_VOLUME_ZSCORE_MAX
+            vz_ok = abs(features["volume_zscore"]) < signal_params["entry_volume_zscore_max"]
             entry_checks.append(("Vol z-score", vz_ok,
-                                 f"|z|={abs(features['volume_zscore']):.3f} vs {ENTRY_VOLUME_ZSCORE_MAX}"))
+                                 f"|z|={abs(features['volume_zscore']):.3f} vs {signal_params['entry_volume_zscore_max']}"))
 
             # 5. EMA20 confirmation (mandatory)
             ma_ok = close > features["ma20"]
@@ -267,9 +309,9 @@ class SignalGenerator:
                                  f"close={close:.2f} vs EMA20={features['ma20']:.2f}"))
 
             # 6. Spread filter
-            spread_ok = spread_pct < ENTRY_SPREAD_MAX_PCT
+            spread_ok = spread_pct < signal_params["entry_spread_max_pct"]
             entry_checks.append(("Spread filter", spread_ok,
-                                 f"spread={spread_pct:.4f}% vs {ENTRY_SPREAD_MAX_PCT}%"))
+                                 f"spread={spread_pct:.4f}% vs {signal_params['entry_spread_max_pct']}%"))
 
             # Momentum and EMA20 are mandatory; at least 2 of remaining 4 must pass
             if not mom_ok or not ma_ok:

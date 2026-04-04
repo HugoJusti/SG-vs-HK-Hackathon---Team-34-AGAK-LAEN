@@ -27,27 +27,27 @@ HMM_TRAINING_HOURS = 1 * 60 * 24    # 2 month
 HMM_RETRAIN_INTERVAL_HOURS = 24     # retrain HMM every 24 hours
 
 # ── Entry Thresholds ─────────────────────────────────────────
-ENTRY_HMM_CONFIDENCE = 0.7045107975162412     # P(bullish) must exceed this
-ENTRY_MAX_VOLATILITY = 0.4081852375640712     # annualised rolling vol cap
-ENTRY_MOMENTUM_MIN = -0.025626688982566925     # 10-period ROC must be > this
-ENTRY_VOLUME_ZSCORE_MAX = 5.6357155422892244  # |z| must be below this
+ENTRY_HMM_CONFIDENCE = 0.494     # P(bullish) must exceed this
+ENTRY_MAX_VOLATILITY = 0.1997     # annualised rolling vol cap
+ENTRY_MOMENTUM_MIN = -0.0346     # 10-period ROC must be > this
+ENTRY_VOLUME_ZSCORE_MAX = 4.5283  # |z| must be below this
 ENTRY_MA_SHORT = 8             # close > EMA8 required
 ENTRY_SPREAD_MAX_PCT = 0.0362     # bid-ask spread filter
 
 # ── Exit Thresholds ──────────────────────────────────────────
 EXIT_HMM_CONFIDENCE = 0.6087      # unused — kept for reference
 EXIT_MA_LONG = 20               # unused — kept for reference
-EXIT_STOP_LOSS_PCT = 0.008179442444647049      # 0.7% drawdown hard stop
-EXIT_TAKE_PROFIT_PCT = 0.004    # 0.7% gain take profit
+EXIT_STOP_LOSS_PCT = 0.007      # 0.7% drawdown hard stop
+EXIT_TAKE_PROFIT_PCT = 0.007    # 0.7% gain take profit
 
 # ── Monte Carlo Position Sizing ──────────────────────────────
 MC_NUM_SIMULATIONS = 1000       # number of forward paths
 MC_HORIZON_HOURS = 24           # how far forward to simulate
-MC_MAX_POSITION_PCT = 0.26585677863599605      # max 30% of portfolio per trade
-MC_MIN_POSITION_PCT = 0.04846657195583672      # min 5% if tail risk too high
+MC_MAX_POSITION_PCT = 0.30      # max 30% of portfolio per trade
+MC_MIN_POSITION_PCT = 0.05      # min 5% if tail risk too high
 MC_HIGH_CONFIDENCE_THRESHOLD = 0.85
 MC_LOW_CONFIDENCE_THRESHOLD = 0.60
-MC_TAIL_RISK_LIMIT = 0.03154926242506328       # 5th percentile loss cap (2%)
+MC_TAIL_RISK_LIMIT = 0.02       # 5th percentile loss cap (2%)
 
 # ── Cooldown ─────────────────────────────────────────────────
 COOLDOWN_MIN_MINUTES = 5        # 5 minutes minimum after exit
