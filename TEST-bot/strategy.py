@@ -25,12 +25,13 @@ from config import (
     SWING_LEFT_BARS, SWING_RIGHT_BARS, SWING_LOOKBACK, SWING_SIGNIFICANCE_ATR_MULT,
     ZONE_MARGIN_PCT,
     SWEEP_TOLERANCE_PCT, SWEEP_LOOKBACK, SWEEP_WICK_RATIO_MIN,
-    BOS_LOOKBACK,
+    BOS_LOOKBACK, BOS_CLOSE_BUFFER_PCT, BOS_MAX_AGE_CANDLES,
+    POI_TOUCH_LOOKBACK,
     RSI_OVERBOUGHT,
-    FVG_LOOKBACK, MIN_CONFLUENCES, CONFLUENCE_WEIGHTS,
+    MIN_CONFLUENCES, CONFLUENCE_WEIGHTS,
     ENTRY_SPREAD_MAX_PCT,
     RISK_PER_TRADE_PCT, MAX_POSITION_PCT, MIN_POSITION_PCT,
-    SL_BUFFER_PCT, TP_MIN_PCT, TP_MAX_PCT,
+    SL_BUFFER_PCT, TP_MIN_PCT, TP_MAX_PCT, MIN_RR_RATIO,
     VOLUME_SPIKE_MULT,
 )
 
@@ -130,19 +131,38 @@ def build_market_structure(df: pd.DataFrame, lookback: int = None) -> list:
     return swings
 
 
-def get_structural_tp(structure: list, bos_level: float) -> float | None:
+def get_structural_tp(structure: list, bos_level: float,
+                      entry_price: float = None, sl_price: float = None,
+                      min_rr: float = None) -> float | None:
     """
-    Return the nearest structural high above the BOS level.
-    This is the next resistance the price is likely to react at after BOS.
-    Returns None if no structural high exists above the BOS level.
+    Return the lowest structural high above BOS that also satisfies the
+    minimum R:R ratio (if entry_price, sl_price, and min_rr are provided).
+
+    Walks candidates in ascending order — skips any high that would give
+    R:R < min_rr, so the nearest *valid* target is returned, not just the nearest.
+    Returns None if no candidate clears both the level and the R:R requirement.
     """
-    candidates = [
-        s for s in structure
-        if s["type"] == "high" and s["price"] > bos_level
-    ]
+    candidates = sorted(
+        [s for s in structure if s["type"] == "high" and s["price"] > bos_level],
+        key=lambda s: s["price"],
+    )
     if not candidates:
         return None
-    return float(min(candidates, key=lambda s: s["price"])["price"])
+
+    # No R:R filter requested — return nearest
+    if entry_price is None or sl_price is None or min_rr is None:
+        return float(candidates[0]["price"])
+
+    sl_dist = entry_price - sl_price
+    if sl_dist <= 0:
+        return float(candidates[0]["price"])
+
+    for c in candidates:
+        rr = (c["price"] - entry_price) / sl_dist
+        if rr >= min_rr:
+            return float(c["price"])
+
+    return None  # every structural high is too close relative to the SL
 
 
 def get_trailing_sl(df: pd.DataFrame, entry_time: str,
@@ -350,6 +370,67 @@ def detect_poi_touch(df: pd.DataFrame, poi_low: float, poi_high: float,
     return {"touched": False}
 
 
+def detect_choch(df: pd.DataFrame, disrespect_idx: int) -> dict:
+    """
+    Change of Character (CHoCH): after a zone is disrespected (close below its floor),
+    track the resulting selling move and detect when price closes back above the HIGH
+    of that sell candle (+ BOS_CLOSE_BUFFER_PCT).
+
+    When CHoCH fires, the LOW of the selling move becomes a new candidate demand zone.
+
+    Args:
+        df:               full 5m dataframe
+        disrespect_idx:   bar index where the zone-breaking close occurred
+
+    Returns:
+        {
+            "choch":        True/False
+            "sell_low":     lowest low of the selling move (new zone bottom)
+            "sell_high":    high of the selling move candle (CHoCH level)
+            "choch_close":  close that confirmed CHoCH
+            "new_zone":     {"low": sell_low, "high": sell_high, "mid": ..., "label": "CHoCH"}
+        }
+        or {"choch": False, "sell_low": float, "sell_high": float}
+    """
+    if disrespect_idx >= len(df) - 1:
+        return {"choch": False}
+
+    sell_segment = df.iloc[disrespect_idx:]
+    if sell_segment.empty:
+        return {"choch": False}
+
+    # Find the lowest low and its candle high during the selling move
+    sell_low_idx  = int(sell_segment["low"].idxmin())
+    sell_low      = float(sell_segment["low"].min())
+    sell_high     = float(df.iloc[sell_low_idx]["high"])   # high of the lowest candle
+    choch_level   = sell_high * (1 + BOS_CLOSE_BUFFER_PCT)
+
+    # Scan candles after the sell low for a close above that level
+    post_sell = df.iloc[sell_low_idx + 1:]
+    for i, row in post_sell.iterrows():
+        if float(row["close"]) >= choch_level:
+            new_zone = {
+                "low":   round(sell_low, 6),
+                "high":  round(sell_high, 6),
+                "mid":   round((sell_low + sell_high) / 2, 6),
+                "label": "CHoCH",
+            }
+            return {
+                "choch":       True,
+                "sell_low":    round(sell_low, 6),
+                "sell_high":   round(sell_high, 6),
+                "choch_close": round(float(row["close"]), 6),
+                "choch_idx":   i,
+                "new_zone":    new_zone,
+            }
+
+    return {
+        "choch":      False,
+        "sell_low":   round(sell_low, 6),
+        "sell_high":  round(sell_high, 6),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════
 # LIQUIDITY SWEEP
 # ═══════════════════════════════════════════════════════════════
@@ -428,9 +509,9 @@ def detect_bos(df: pd.DataFrame, sweep_candle_idx: int = None) -> dict:
         post_df   = df.iloc[sweep_candle_idx + 1:]
     else:
         # Standalone mode: find swing high in last BOS_LOOKBACK bars,
-        # then check if any of the last 5 closed candles broke it.
+        # then check if any of the last 20 closed candles broke it.
         pre_df  = df.iloc[-BOS_LOOKBACK:] if len(df) >= BOS_LOOKBACK else df
-        post_df = df.iloc[-5:]
+        post_df = df.iloc[-20:]
 
     if pre_df.empty:
         return {"bos": False}
@@ -439,57 +520,35 @@ def detect_bos(df: pd.DataFrame, sweep_candle_idx: int = None) -> dict:
     if bos_level is None:
         bos_level = float(pre_df["close"].max())
 
+    required_close = bos_level * (1 + BOS_CLOSE_BUFFER_PCT)
+
     for i, row in enumerate(post_df.itertuples()):
-        if row.close > bos_level:
+        if row.close >= required_close:
             return {
                 "bos":            True,
                 "bos_level":      round(bos_level, 6),
                 "bos_candle_idx": (sweep_candle_idx + 1 + i) if sweep_candle_idx is not None else len(df) - 5 + i,
                 "bos_close":      round(float(row.close), 6),
+                "bos_buffer_pct": BOS_CLOSE_BUFFER_PCT * 100,
             }
 
-    # No live price entry — only confirmed candle closes count
-    return {"bos": False, "bos_level": round(bos_level, 6)}
+    # No confirmed close sufficiently above level
+    return {"bos": False, "bos_level": round(bos_level, 6),
+            "required_close": round(required_close, 6)}
 
 
 # ═══════════════════════════════════════════════════════════════
 # CONFLUENCE SCORING
 # ═══════════════════════════════════════════════════════════════
 
-def _detect_fvg(df: pd.DataFrame) -> list:
-    """
-    Bullish FVG: candle[i-2].high < candle[i].low.
-    Only counted if the gap midpoint is within 2×ATR of the current close —
-    a distant FVG from hours ago at a different price level is not confluent.
-    """
-    recent        = df.iloc[-FVG_LOOKBACK:] if len(df) >= FVG_LOOKBACK else df
-    highs         = recent["high"].values
-    lows          = recent["low"].values
-    current_close = float(df["close"].iloc[-1])
-    atr_val       = float(df["atr"].iloc[-1]) if "atr" in df.columns and df["atr"].iloc[-1] > 0 else 0
-    proximity     = 2.0 * atr_val if atr_val > 0 else current_close * 0.02
-
-    fvgs = []
-    for i in range(2, len(recent)):
-        if highs[i - 2] < lows[i]:
-            bottom = float(highs[i - 2])
-            top    = float(lows[i])
-            mid    = (bottom + top) / 2
-            if abs(mid - current_close) <= proximity:
-                fvgs.append({"bottom": bottom, "top": top})
-    return fvgs
-
-
 def compute_confluences(df: pd.DataFrame, sweep_info: dict,
-                        equil_level: float = None,
-                        current_price: float = None,
-                        atr_val: float = 0) -> tuple:
+                        poi_low: float = None, bos_level: float = None,
+                        current_price: float = None) -> tuple:
     """
-    Weighted confluence scoring (max = 11, threshold = MIN_CONFLUENCES = 4).
+    Weighted confluence scoring (max = 8, threshold = MIN_CONFLUENCES = 3).
       sweep detected:    +2  — smart money stop-hunt fingerprint
       vol spike on sweep:+1  — institutional volume confirmation
-      equilibrium:       +2  — price at 50% of impulse leg (ideal retrace depth)
-      fvg near price:    +2  — price inefficiency / imbalance at entry
+      equilibrium:       +2  — price in 40-60% band of POI-low to BOS impulse
       ema50:             +1  — 5m trend filter
       macd:              +1  — momentum filter
       rsi:               +1  — not overbought
@@ -541,32 +600,31 @@ def compute_confluences(df: pd.DataFrame, sweep_info: dict,
         else:
             reasons.append(f"[FAIL  0] Price {last['close']:.4f} <= EMA50 {last['ema50']:.4f}")
 
-    # ── FVG ───────────────────────────────────────────────────────
-    fvgs = _detect_fvg(df)
-    if fvgs:
-        score += w["fvg"]
-        reasons.append(f"[PASS +{w['fvg']}] {len(fvgs)} FVG(s) near price in last {FVG_LOOKBACK} candles")
-    else:
-        reasons.append(f"[FAIL  0] No nearby FVG in last {FVG_LOOKBACK} candles")
-
     # ── Equilibrium ───────────────────────────────────────────────
-    # 50% level of the impulse leg (zone low → BOS level).
-    # Price near equilibrium means it retraced exactly halfway — the ideal
-    # SMC entry: not too deep (structure broken), not too shallow (still risky).
-    if equil_level is not None and current_price is not None:
-        tolerance = atr_val if atr_val > 0 else current_price * 0.01
-        dist      = abs(current_price - equil_level)
-        if dist <= tolerance:
-            score += 2
-            reasons.append(
-                f"[PASS +2] Equilibrium: price {current_price:.4f} "
-                f"at/near 50% level {equil_level:.4f} (within {dist/equil_level*100:.2f}%)"
-            )
-        else:
-            reasons.append(
-                f"[    + 0] Equilibrium {equil_level:.4f} — "
-                f"price {dist/equil_level*100:.2f}% away (>{tolerance/equil_level*100:.2f}% tolerance)"
-            )
+    # Price is in the true 40–60% band of the impulse leg (poi_low → bos_level).
+    # 40% level = poi_low + 0.40 * impulse
+    # 60% level = poi_low + 0.60 * impulse
+    # Midpoint (50%) = equilibrium level.
+    if poi_low is not None and bos_level is not None and current_price is not None:
+        impulse    = bos_level - poi_low
+        if impulse > 1e-10:
+            eq_low   = poi_low + 0.40 * impulse
+            eq_high  = poi_low + 0.60 * impulse
+            equil_mid = poi_low + 0.50 * impulse
+            if eq_low <= current_price <= eq_high:
+                score += 2
+                pct_from = (current_price - equil_mid) / equil_mid * 100
+                reasons.append(
+                    f"[PASS +2] Equilibrium: price {current_price:.4f} "
+                    f"in 40-60% band [{eq_low:.4f}-{eq_high:.4f}] "
+                    f"({pct_from:+.2f}% from 50% level)"
+                )
+            else:
+                side = "above" if current_price > eq_high else "below"
+                reasons.append(
+                    f"[    + 0] Equilibrium band [{eq_low:.4f}-{eq_high:.4f}] — "
+                    f"price {current_price:.4f} is {side} the discount zone"
+                )
 
     return score, reasons
 
@@ -596,11 +654,16 @@ def calculate_position_size(portfolio_value: float, entry_price: float,
     max_usd      = portfolio_value * MAX_POSITION_PCT
     position_usd = max(min_usd, min(max_usd, position_usd))
 
+    # Actual risk after clamping — may exceed target if cap kicked in
+    actual_risk_usd = position_usd * sl_dist_pct
+    actual_risk_pct = actual_risk_usd / portfolio_value if portfolio_value > 0 else 0.0
+
     return {
         "position_usd":    round(position_usd, 2),
         "position_pct":    round(position_usd / portfolio_value, 4),
         "risk_amount":     round(risk_amount, 2),
         "sl_distance_pct": round(sl_dist_pct * 100, 4),
+        "actual_risk_pct": round(actual_risk_pct * 100, 4),  # real % at risk after cap
     }
 
 
@@ -691,49 +754,25 @@ class SMCSignalGenerator:
                 f"> 1H EMA50 {htf_last['ema50']:.4f}"
             )
 
-        atr_val = float(df["atr"].iloc[-1]) if "atr" in df.columns and df["atr"].iloc[-1] > 0 else 0
-
-        # Gate 2 — Price must have TOUCHED a POI (support zone or FVG).
+        # Gate 2 — Price must have TOUCHED a POI (structural support zone).
         # The sequence enforced here:
-        #   price retraces INTO zone/FVG  →  candle touches it  →  THEN BOS from there
-        # Both support zone and FVG are valid POIs. We find the best one,
-        # confirm price actually visited it recently, then anchor BOS to that touch.
+        #   price retraces INTO zone  ->  candle touches it  ->  THEN BOS from there
 
-        zone    = get_recent_support_zone(df)
-        fvgs    = _detect_fvg(df)
-        fvg_poi = min(fvgs, key=lambda f: abs((f["bottom"] + f["top"]) / 2 - current_price)) if fvgs else None
-
-        # Determine active POI (prefer support zone, fall back to FVG)
-        poi_low = poi_high = None
-        poi_label = ""
-        if zone is not None:
-            poi_low   = zone["low"]
-            poi_high  = zone["high"]
-            poi_label = f"support zone {zone['low']:.4f}-{zone['high']:.4f} [{zone['label']}]"
-            if fvg_poi is not None:
-                # If FVG overlaps or is closer, note it too
-                fvg_mid = (fvg_poi["bottom"] + fvg_poi["top"]) / 2
-                zone_mid = zone["mid"]
-                if abs(fvg_mid - current_price) < abs(zone_mid - current_price):
-                    poi_low   = min(zone["low"], fvg_poi["bottom"])
-                    poi_high  = max(zone["high"], fvg_poi["top"])
-                    poi_label += f" + FVG {fvg_poi['bottom']:.4f}-{fvg_poi['top']:.4f}"
-        elif fvg_poi is not None:
-            poi_low   = fvg_poi["bottom"]
-            poi_high  = fvg_poi["top"]
-            poi_label = f"FVG {fvg_poi['bottom']:.4f}-{fvg_poi['top']:.4f}"
-
-        if poi_low is None:
+        zone = get_recent_support_zone(df)
+        if zone is None:
             return {
                 "action":  "HOLD",
                 "reasons": reasons + [
-                    f"[FAIL G2] No POI found — no structural support zone or nearby FVG",
-                    f"  ->need a demand area for price to retrace into before BOS",
+                    "[FAIL G2] No structural support zone found",
+                    "  ->need an ATR-significant swing low to define demand area",
                 ],
             }
+        poi_low   = zone["low"]
+        poi_high  = zone["high"]
+        poi_label = f"support zone {zone['low']:.4f}-{zone['high']:.4f} [{zone['label']}]"
 
-        # Confirm price actually touched the POI recently (within 30 candles)
-        touch = detect_poi_touch(df, poi_low, poi_high, lookback=30)
+        # Confirm price actually touched the POI recently
+        touch = detect_poi_touch(df, poi_low, poi_high, lookback=POI_TOUCH_LOOKBACK)
         if not touch["touched"]:
             dist_pct = (current_price - poi_high) / poi_high * 100 if current_price > poi_high else \
                        (poi_low - current_price) / poi_low * 100
@@ -745,19 +784,69 @@ class SMCSignalGenerator:
                 ],
             }
 
+        # Zone disrespect check — scan every candle from touch to now.
+        # If any CLOSE is below poi_low the zone was broken, not just wicked through.
+        post_touch = df.iloc[touch["touch_idx"]:]
+        disrespect_candle = None
+        for _, c in post_touch.iterrows():
+            if float(c["close"]) < poi_low:
+                disrespect_candle = c
+                break
+
+        if disrespect_candle is not None:
+            # Zone broken — check for CHoCH (Change of Character).
+            # If the selling move that followed already flipped back up,
+            # the sell low becomes a new demand zone and we re-evaluate from there.
+            try:
+                disrespect_idx = df.index.get_loc(disrespect_candle.name)
+            except Exception:
+                disrespect_idx = touch["touch_idx"]
+            choch = detect_choch(df, disrespect_idx)
+
+            if choch["choch"]:
+                # Promote the CHoCH zone as the new POI and continue evaluation
+                poi_low   = choch["new_zone"]["low"]
+                poi_high  = choch["new_zone"]["high"]
+                poi_label = (
+                    f"CHoCH zone {poi_low:.4f}-{poi_high:.4f} "
+                    f"(sell low after disrespect of original zone)"
+                )
+                reasons.append(
+                    f"[INFO] Original zone disrespected at {disrespect_candle['close']:.4f}, "
+                    f"but CHoCH confirmed at {choch['choch_close']:.4f} — "
+                    f"new demand zone set at {poi_low:.4f}-{poi_high:.4f}"
+                )
+                # Re-anchor touch to CHoCH candle so BOS is searched from there
+                touch = {
+                    "touched":     True,
+                    "touch_idx":   choch["choch_idx"],
+                    "touch_low":   choch["sell_low"],
+                    "touch_close": choch["choch_close"],
+                }
+            else:
+                return {
+                    "action":  "HOLD",
+                    "reasons": reasons + [
+                        f"[FAIL G2] Zone disrespected — closed at "
+                        f"{disrespect_candle['close']:.4f} below zone floor {poi_low:.4f}",
+                        f"  ->watching for CHoCH above {choch.get('sell_high', 0):.4f} "
+                        f"to form new demand zone at sell low {choch.get('sell_low', 0):.4f}",
+                    ],
+                }
+
         reasons.append(
-            f"[PASS G2] POI touched: {poi_label} | "
+            f"[PASS G2] POI touched & held: {poi_label} | "
             f"touch low={touch['touch_low']:.4f} at bar {touch['touch_idx']}"
         )
 
         # Gate 3 — BOS anchored to the POI touch candle.
         # Only candles AFTER the touch count — BOS must come from the zone, not before it.
-        # Also check for liquidity sweep at the touch (bonus, not required).
-        swing_lows = detect_swing_lows(df)
-        all_zones  = build_support_zones(swing_lows)
-        sweep      = detect_liquidity_sweep(df, all_zones)
+        # Sweep check uses the SAME G2 zone (not a separate clustered zone set).
+        g2_zone_list = [{"low": poi_low, "high": poi_high,
+                         "mid": zone["mid"], "strength": 1}]
+        sweep = detect_liquidity_sweep(df, g2_zone_list)
 
-        # Anchor BOS to touch candle (sweep preferred if it aligns)
+        # Anchor BOS to touch candle (sweep preferred if it aligns with touch)
         if sweep["swept"] and sweep["candle_idx"] >= touch["touch_idx"]:
             bos = detect_bos(df, sweep["candle_idx"])
         else:
@@ -765,26 +854,44 @@ class SMCSignalGenerator:
             bos   = detect_bos(df, sweep_candle_idx=touch["touch_idx"])
 
         if not bos["bos"]:
-            bos_level  = bos.get("bos_level", 0)
-            gap_to_bos = (bos_level - current_price) / current_price * 100 if bos_level > current_price else 0
+            bos_level_val  = bos.get("bos_level", 0)
+            required_close = bos.get("required_close", bos_level_val)
+            gap_to_bos     = (required_close - current_price) / current_price * 100 if required_close > current_price else 0
             return {
                 "action":  "HOLD",
                 "reasons": reasons + [
-                    f"[FAIL G3] No BOS after POI touch — waiting for close above {bos_level:.4f} "
-                    f"({gap_to_bos:.2f}% above current price)",
-                    f"  ->price touched the zone but hasn't broken structure upward yet",
+                    f"[FAIL G3] No BOS after POI touch — need close >= {required_close:.4f} "
+                    f"(level {bos_level_val:.4f} + {BOS_CLOSE_BUFFER_PCT*100:.1f}% buffer, "
+                    f"{gap_to_bos:.2f}% above current price)",
+                    f"  ->price touched the zone but hasn't closed convincingly above structure",
+                ],
+            }
+
+        # Staleness check — BOS that fired long ago means we'd be entering well into the move
+        bos_age = len(df) - 1 - bos["bos_candle_idx"]
+        if bos_age > BOS_MAX_AGE_CANDLES:
+            return {
+                "action":  "HOLD",
+                "reasons": reasons + [
+                    f"[FAIL G3] BOS is stale — fired {bos_age} candles ago "
+                    f"(max {BOS_MAX_AGE_CANDLES}). Entry price too far from BOS level.",
+                    f"  ->waiting for a fresh BOS closer to current price",
                 ],
             }
 
         sweep_tag = " + sweep" if sweep["swept"] else ""
         reasons.append(
             f"[PASS G3] BOS{sweep_tag} after POI touch: "
-            f"close {bos['bos_close']:.4f} > {bos['bos_level']:.4f}"
+            f"close {bos['bos_close']:.4f} > {bos['bos_level']:.4f} "
+            f"({bos_age} candle(s) ago)"
         )
 
-        # Gate 4 — Confluences. Equilibrium = midpoint of POI low → BOS level.
-        equil_level = (poi_low + bos["bos_level"]) / 2
-        conf_score, conf_reasons = compute_confluences(df, sweep, equil_level, current_price, atr_val)
+        # Gate 4 — Confluences using proper 40-60% equilibrium band of the impulse.
+        conf_score, conf_reasons = compute_confluences(
+            df, sweep,
+            poi_low=poi_low, bos_level=bos["bos_level"],
+            current_price=current_price,
+        )
         reasons.extend(conf_reasons)
         if conf_score < MIN_CONFLUENCES:
             return {
@@ -802,27 +909,50 @@ class SMCSignalGenerator:
         else:
             sl_anchor = min(touch["touch_low"], poi_low)
         sl_price = sl_anchor * (1 - SL_BUFFER_PCT)
+        sl_dist  = current_price - sl_price
 
-        # Build market structure for structural TP
+        # Build market structure for structural TP — skip any high too close for MIN_RR
         structure     = build_market_structure(df)
-        structural_tp = get_structural_tp(structure, bos["bos_level"])
+        structural_tp = get_structural_tp(
+            structure, bos["bos_level"],
+            entry_price=current_price, sl_price=sl_price, min_rr=MIN_RR_RATIO,
+        )
 
         if structural_tp is not None:
-            # Clamp to minimum TP floor
-            tp_price = max(structural_tp, current_price * (1 + TP_MIN_PCT))
+            tp_price  = max(structural_tp, current_price * (1 + TP_MIN_PCT))
+            rr_actual = (tp_price - current_price) / sl_dist if sl_dist > 0 else 0
             reasons.append(
                 f"TP=structural high {structural_tp:.4f} | "
-                f"SL={sl_price:.4f}"
+                f"SL={sl_price:.4f} | R:R={rr_actual:.2f}R"
             )
         else:
-            # ATR fallback when no structural high is found above BOS
-            atr      = float(df["atr"].iloc[-1]) if "atr" in df.columns and df["atr"].iloc[-1] > 0 else 0
-            tp_raw   = (current_price + 2.0 * atr) if atr > 0 else current_price * (1 + TP_MAX_PCT)
-            tp_price = float(np.clip(tp_raw,
-                                     current_price * (1 + TP_MIN_PCT),
-                                     current_price * (1 + TP_MAX_PCT)))
+            # ATR fallback: target at least MIN_RR_RATIO × sl_dist, then clamp
+            atr         = float(df["atr"].iloc[-1]) if "atr" in df.columns and df["atr"].iloc[-1] > 0 else 0
+            tp_from_rr  = current_price + MIN_RR_RATIO * sl_dist
+            tp_from_atr = (current_price + 2.0 * atr) if atr > 0 else tp_from_rr
+            tp_raw      = max(tp_from_rr, tp_from_atr)
+            tp_price    = float(np.clip(tp_raw,
+                                        current_price * (1 + TP_MIN_PCT),
+                                        current_price * (1 + TP_MAX_PCT)))
+            rr_actual   = (tp_price - current_price) / sl_dist if sl_dist > 0 else 0
+
+            # If TP_MAX_PCT cap prevents reaching MIN_RR, the trade has bad R:R — skip
+            if rr_actual < MIN_RR_RATIO:
+                min_tp_needed = current_price + MIN_RR_RATIO * sl_dist
+                return {
+                    "action":  "HOLD",
+                    "reasons": reasons + [
+                        f"[FAIL RR] R:R={rr_actual:.2f}R < min {MIN_RR_RATIO}R — "
+                        f"SL too wide for available TP targets",
+                        f"  ->SL={sl_price:.4f} ({sl_dist/current_price*100:.2f}% risk) | "
+                        f"need TP >= {min_tp_needed:.4f} but max cap is "
+                        f"{current_price * (1 + TP_MAX_PCT):.4f}",
+                    ],
+                }
+
             reasons.append(
-                f"TP=ATR fallback {tp_price:.4f} | SL={sl_price:.4f}"
+                f"TP=ATR fallback {tp_price:.4f} | "
+                f"SL={sl_price:.4f} | R:R={rr_actual:.2f}R"
             )
 
         return {

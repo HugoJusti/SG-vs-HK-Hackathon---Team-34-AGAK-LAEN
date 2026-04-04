@@ -32,9 +32,12 @@ ZONE_MARGIN_PCT = 0.003  # cluster swing lows within 0.3% of each other
 SWEEP_TOLERANCE_PCT  = 0.001  # min 0.1% wick below zone to qualify
 SWEEP_LOOKBACK       = 10     # check last N completed candles for a sweep
 SWEEP_WICK_RATIO_MIN = 0.30   # lower wick must be ≥ 30% of total candle range
+POI_TOUCH_LOOKBACK   = 50     # candles to look back for a POI touch (50 bars = 4.2 hours)
 
 # ── Break of Structure ───────────────────────────────────────
-BOS_LOOKBACK     = 30     # look back N candles for the most recent swing high
+BOS_LOOKBACK          = 5    # look back N candles for the most recent swing high
+BOS_CLOSE_BUFFER_PCT  = 0.001  # close must be ≥ 0.1% above BOS level — filters marginal breaks
+BOS_MAX_AGE_CANDLES   = 10    # skip entry if BOS fired more than N candles ago (stale setup)
 
 # ── Indicators ───────────────────────────────────────────────
 RSI_PERIOD         = 14
@@ -46,27 +49,25 @@ EMA_TREND_PERIOD   = 50   # bullish bias when price is above this EMA
 VOLUME_MA_PERIOD   = 20
 VOLUME_SPIKE_MULT  = 1.5  # sweep volume must be ≥ this × rolling average
 
-# ── Fair Value Gap ───────────────────────────────────────────
-FVG_LOOKBACK = 30  # scan last N candles for bullish FVGs
-
 # ── Higher Timeframe Filter ──────────────────────────────────
 HTF_INTERVAL  = "1h"   # timeframe for macro trend bias
 HTF_FETCH_DAYS = 30    # how many days of 1H candles to fetch
 
 # ── Confluences (weighted scoring) ───────────────────────────
-# Sweep presence: 2pts  (stop-hunt fingerprint — optional bonus)
-# Vol spike on sweep: 1pt extra if sweep also had volume
-# fvg: 2pts  (price inefficiency near entry)
-# ema50, macd, rsi: 1pt each (supporting filters)
-# Max score = 9 (with sweep+vol) or 5 (without sweep)
+# Sweep presence:     +2  (stop-hunt fingerprint — optional bonus)
+# Vol spike on sweep: +1  (extra if sweep had volume)
+# Equilibrium:        +2  (price in 40-60% retrace band)
+# EMA50:              +1  (5m trend filter)
+# MACD:               +1  (momentum)
+# RSI:                +1  (not overbought)
+# Max score = 8 (sweep+vol+equil+ema+macd+rsi), min without sweep = 5
 CONFLUENCE_WEIGHTS = {
-    "vol_spike": 2,   # reused as sweep-presence weight
-    "fvg":       2,
+    "vol_spike": 2,   # used as sweep-presence weight
     "ema50":     1,
     "macd":      1,
     "rsi":       1,
 }
-MIN_CONFLUENCES = 4  # minimum weighted score required to enter (out of 9)
+MIN_CONFLUENCES = 3  # minimum score to enter (lowered since FVG +2 removed)
 
 # ── Entry Filter ─────────────────────────────────────────────
 ENTRY_SPREAD_MAX_PCT = 0.05  # skip pair if bid-ask spread exceeds this
@@ -80,10 +81,14 @@ MIN_POSITION_PCT   = 0.05   # floor: at least 5% if SL is very wide
 SL_BUFFER_PCT    = 0.002  # place SL 0.2% below the sweep wick low
 TP_MIN_PCT       = 0.008  # minimum take profit of 0.8%
 TP_MAX_PCT       = 0.04   # cap take profit at 4%
+MIN_RR_RATIO     = 1.5    # minimum reward:risk ratio — skip trade if TP can't reach this
 RECONCILE_SL_PCT = 0.03   # fallback SL for reconciled positions: 3% below current price
 
 # ── Concurrent Positions ────────────────────────────────────
 MAX_CONCURRENT_POSITIONS = 2   # at most 2 open trades across all pairs at once
+
+# ── Daily Loss Circuit Breaker ───────────────────────────────
+MAX_DAILY_LOSS_PCT = 0.06      # stop all new entries if portfolio drops >6% in one calendar day
 
 # ── Cooldown ─────────────────────────────────────────────────
 COOLDOWN_MIN_MINUTES        = 10    # minimum wait after closing a position

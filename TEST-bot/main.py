@@ -29,6 +29,7 @@ from config import (
     DATA_REFRESH_INTERVAL_MINUTES,
     LOG_DIR, LOG_LEVEL, LOG_SIGNALS_FILE, LOG_ERRORS_FILE,
     RECONCILE_SL_PCT, TP_MIN_PCT, MAX_CONCURRENT_POSITIONS,
+    RISK_PER_TRADE_PCT, MAX_DAILY_LOSS_PCT,
 )
 from data import (
     load_or_fetch_historical, load_or_fetch_htf,
@@ -181,6 +182,10 @@ class TradingBot:
         self.exchange_info = {}   # Fix 4: cached once at startup
         self.logger        = logging.getLogger("Bot")
 
+        # Daily loss circuit breaker
+        self.daily_start_value = 0.0   # portfolio value at start of today
+        self.daily_date        = None  # calendar date of daily_start_value snapshot
+
     # ── Initialisation ──────────────────────────────────────────
 
     def initialise(self):
@@ -298,6 +303,27 @@ class TradingBot:
                     portfolio_value += qty * t["last"]
         self.logger.info("Portfolio value: $%s", f"{portfolio_value:,.2f}")
 
+        # ── Daily loss circuit breaker ────────────────────────────
+        today = datetime.utcnow().date()
+        if self.daily_date != today:
+            self.daily_start_value = portfolio_value
+            self.daily_date        = today
+            self.logger.info(
+                "New trading day — daily baseline set at $%.2f (max loss: $%.2f / %.0f%%)",
+                self.daily_start_value,
+                self.daily_start_value * MAX_DAILY_LOSS_PCT,
+                MAX_DAILY_LOSS_PCT * 100,
+            )
+        daily_loss_pct = (self.daily_start_value - portfolio_value) / self.daily_start_value \
+                         if self.daily_start_value > 0 else 0.0
+        daily_breaker_tripped = daily_loss_pct >= MAX_DAILY_LOSS_PCT
+        if daily_breaker_tripped:
+            self.logger.warning(
+                "DAILY LOSS CIRCUIT BREAKER: down %.2f%% today (limit %.0f%%) — "
+                "all new BUY entries blocked",
+                daily_loss_pct * 100, MAX_DAILY_LOSS_PCT * 100,
+            )
+
         # Count open positions for concurrent cap
         open_count = sum(
             1 for p in PAIRS if self.positions.get(p).get("side") == "long"
@@ -354,7 +380,9 @@ class TradingBot:
                 self.logger.info("    %s", r)
 
             if signal["action"] == "BUY":
-                if open_count >= MAX_CONCURRENT_POSITIONS:
+                if daily_breaker_tripped:
+                    self.logger.info("  BUY blocked: daily loss circuit breaker active")
+                elif open_count >= MAX_CONCURRENT_POSITIONS:
                     self.logger.info(
                         "  BUY blocked: %d/%d positions already open",
                         open_count, MAX_CONCURRENT_POSITIONS,
@@ -402,13 +430,22 @@ class TradingBot:
             self.logger.info("  Order too small after rounding — skipping")
             return
 
+        actual_risk_pct = sizing["actual_risk_pct"]
+        target_risk_pct = RISK_PER_TRADE_PCT * 100
+        if actual_risk_pct > target_risk_pct * 1.5:
+            self.logger.warning(
+                "  Risk cap kicked in: actual risk %.2f%% >> target %.2f%% "
+                "(SL very close — position hit 30%% cap)",
+                actual_risk_pct, target_risk_pct,
+            )
+
         self.logger.info(
             "  BUYING %s: qty=%.6f | ~$%.2f (%.1f%% of portfolio) | "
-            "SL=%.4f | TP=%.4f | Risk=%.2f%% | SL-dist=%.4f%%",
+            "SL=%.4f | TP=%.4f | Target risk=%.2f%% | Actual risk=%.2f%% | SL-dist=%.4f%%",
             pair, quantity, position_usd,
             sizing["position_pct"] * 100,
             sl_price, tp_price,
-            sizing["risk_amount"] / portfolio_value * 100,
+            target_risk_pct, actual_risk_pct,
             sizing["sl_distance_pct"],
         )
 
