@@ -12,7 +12,7 @@ SECRET_KEY = os.getenv("RST_SECRET_KEY", "YOUR_SECRET_KEY_HERE")
 BASE_URL   = "https://mock-api.roostoo.com"
 
 # ── Trading Pairs ────────────────────────────────────────────
-PAIRS = ["TRX/USD", "TAO/USD", "SOL/USD", "FET/USD"]  # bullish-trend altcoins
+PAIRS = ["TRX/USD", "TAO/USD", "SOL/USD", "FET/USD", "AVAX/USD", "BNB/USD"]  # bullish-trend altcoins
 
 # ── Historical Data ──────────────────────────────────────────
 DATA_FETCH_HOURS              = 14 * 24   # 14 days of 5m candles (~4032 candles)
@@ -85,7 +85,7 @@ MIN_RR_RATIO     = 2.0    # minimum reward:risk ratio — skip trade if TP can't
 RECONCILE_SL_PCT = 0.03   # fallback SL for reconciled positions: 3% below current price
 
 # ── Concurrent Positions ────────────────────────────────────
-MAX_CONCURRENT_POSITIONS = 2   # at most 2 open trades across all pairs at once
+MAX_CONCURRENT_POSITIONS = 4   # at most 4 open trades across all pairs at once
 
 # ── Daily Loss Circuit Breaker ───────────────────────────────
 MAX_DAILY_LOSS_PCT = 0.06      # stop all new entries if portfolio drops >6% in one calendar day
