@@ -403,7 +403,7 @@ class TradingBot:
                     self._execute_buy(pair, ticker, portfolio_value, signal)
                     open_count += 1
             elif signal["action"] == "SELL":
-                self._execute_sell(pair, ticker, signal)
+                self._execute_sell(pair, ticker, signal, wallet)
                 open_count -= 1
 
             self._log_signal(pair, signal, ticker, position)
@@ -471,11 +471,23 @@ class TradingBot:
 
     # ── Sell ─────────────────────────────────────────────────────
 
-    def _execute_sell(self, pair: str, ticker: dict, signal: dict):
+    def _execute_sell(self, pair: str, ticker: dict, signal: dict, wallet: dict = None):
         position        = self.positions.get(pair)
         quantity        = position.get("quantity", 0)
         pair_info       = self.exchange_info.get("TradePairs", {}).get(pair, {})
         price_precision = pair_info.get("PricePrecision", 2)
+
+        # Clamp to actual available balance — exchange commission on buy can leave
+        # slightly less coins than the quantity we stored in state.
+        if wallet is not None:
+            coin      = pair.split("/")[0]
+            available = wallet.get(coin, {}).get("Free", 0)
+            if 0 < available < quantity:
+                self.logger.warning(
+                    "  Sell qty clamped: stored=%.6f, available=%.6f (commission dust)",
+                    quantity, available,
+                )
+                quantity = available
 
         if quantity <= 0:
             self.logger.warning("  No position to sell for %s", pair)
