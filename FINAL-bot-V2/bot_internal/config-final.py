@@ -78,7 +78,7 @@ MAX_POSITION_PCT   = 0.30   # hard cap: no more than 30% per trade
 MIN_POSITION_PCT   = 0.05   # floor: at least 5% if SL is very wide
 
 # ── Stop Loss / Take Profit ──────────────────────────────────
-SL_BUFFER_PCT    = 0.002  # place SL 0.2% below the sweep wick low
+SL_BUFFER_PCT    = 0.003  # place SL 0.3% below the sweep wick low — absorbs 5m noise wicks on volatile altcoins
 TP_MIN_PCT       = 0.008  # minimum take profit of 0.8%
 TP_MAX_PCT       = 0.08   # cap take profit at 8% — altcoins regularly move this far on valid setups
 MIN_RR_RATIO     = 2.0    # minimum reward:risk ratio — skip trade if TP can't reach this
