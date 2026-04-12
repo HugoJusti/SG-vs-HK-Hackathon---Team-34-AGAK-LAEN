@@ -39,6 +39,9 @@ Positions exit under two hard rules (whichever triggers first):
 
 ## 2. Architecture
 -----------------------------------
+### System design diagram:
+![Bot Flow Diagram](Workflow-Trading-Bot-V2.png)
+
 ### Components:
 - **main-final.py** — orchestrates the full bot workflow, polling loop every 30 seconds
 - **bot_internal/config-final.py** — all strategy parameters and API credentials
