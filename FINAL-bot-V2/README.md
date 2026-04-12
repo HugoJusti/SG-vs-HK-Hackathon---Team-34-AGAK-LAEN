@@ -124,7 +124,7 @@ If the resulting order is under $1 after rounding to exchange precision, the tra
 
 ### Assumptions Made:
 - Binance 5-minute and 1-hour OHLCV data is a valid proxy for training and backtesting the SMC strategy, even though live trading executes on Roostoo
-- 14 days of 5m candles (~4032 bars) provides sufficient history for swing detection and indicator warm-up
+- 14 days of 5m candles provides sufficient history for swing detection and indicator warm-up
 - A 0.3% SL buffer below sweep lows adequately absorbs 5-minute noise wicks on volatile altcoins without being too wide to maintain a 2.0 R:R
 
 ## 4. Setup Instructions & How to Run Bot
