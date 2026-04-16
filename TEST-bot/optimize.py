@@ -37,7 +37,7 @@ STARTING_BALANCE    = 50_000.0
 COMMISSION          = 0.0005          # 0.05% per side (Roostoo rate)
 BACKTEST_SPREAD_PCT = 0.001           # 0.1% simulated spread
 WARMUP_CANDLES      = 300             # candles needed before first signal
-PAIRS               = ["TRX/USD", "TAO/USD", "SOL/USD"]
+PAIRS               = ["TRX/USD", "TAO/USD", "SOL/USD", "FET/USD", "AVAX/USD", "BNB/USD"]
 
 
 # ═══════════════════════════════════════════════════════════════
