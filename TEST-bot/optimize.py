@@ -290,7 +290,7 @@ def main():
     print("  SMC BACKTEST ENGINE")
     print(f"  Pairs : {', '.join(PAIRS)}")
     print(f"  Logic : strategy.py → SMCSignalGenerator (exact live logic)")
-    print(f"  Split : 80% in-sample / 20% out-of-sample")
+    print(f"  Split : full dataset")
     print("=" * 65)
 
     # Load data
@@ -305,37 +305,21 @@ def main():
         print("No data loaded. Run the bot once to populate the data/ cache.")
         return
 
-    # Find split index
     min_len = min(len(v["df5"]) for v in all_frames.values())
-    split   = int(min_len * 0.80)
     print(f"\nTotal candles (shortest pair): {min_len}")
-    print(f"In-sample  : 0 → {split}  ({split} bars)")
-    print(f"Out-sample : {split} → {min_len}  ({min_len - split} bars)")
 
-    # ── In-sample backtest ──────────────────────────────────────
-    print("\nRunning IN-SAMPLE backtest…")
-    in_frames = {p: {"df5": v["df5"].iloc[:split].reset_index(drop=True),
-                     "df1h": v["df1h"]}
-                 for p, v in all_frames.items()}
-    in_stats = run_backtest(in_frames)
-    print_stats("IN-SAMPLE RESULTS (first 80%)", in_stats)
-    print_trade_log(in_stats["trades"])
-
-    # ── Out-of-sample backtest ──────────────────────────────────
-    print("\nRunning OUT-OF-SAMPLE backtest…")
-    oos_frames = {p: {"df5": v["df5"].iloc[split:].reset_index(drop=True),
-                      "df1h": v["df1h"]}
-                  for p, v in all_frames.items()}
-    oos_stats = run_backtest(oos_frames)
-    print_stats("OUT-OF-SAMPLE RESULTS (last 20%)", oos_stats)
-    print_trade_log(oos_stats["trades"])
+    # ── Full backtest ───────────────────────────────────────────
+    print("\nRunning backtest on all data…")
+    stats = run_backtest(all_frames)
+    print_stats("FULL BACKTEST RESULTS", stats)
+    print_trade_log(stats["trades"])
 
     # ── Per-pair breakdown ──────────────────────────────────────
     print(f"\n{'='*65}")
-    print("  PER-PAIR TRADE BREAKDOWN (out-of-sample)")
+    print("  PER-PAIR TRADE BREAKDOWN")
     print(f"{'='*65}")
     for pair in PAIRS:
-        pair_sells = [t for t in oos_stats["trades"]
+        pair_sells = [t for t in stats["trades"]
                       if t["side"] == "SELL" and t["pair"] == pair]
         if not pair_sells:
             print(f"  {pair:<10}: no closed trades")
